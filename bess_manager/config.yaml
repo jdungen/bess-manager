@@ -1,8 +1,9 @@
 name: "BESS Manager"
 description: "Battery Energy Storage System optimization and management"
-version: "9.6.2-jvdd.1"
+version: "9.6.2-jvdd.2"
 slug: "bess_manager"
-image: "ghcr.io/johanzander/bess-manager-{arch}"
+# image: removed for jvdd fork — HA builds locally from Dockerfile
+# (the johanzander GHCR registry does not publish jvdd tags)
 init: false
 arch:
   - aarch64

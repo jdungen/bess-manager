@@ -4,6 +4,12 @@ All notable changes to BESS Battery Manager will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [9.6.2-jvdd.2] - 2026-06-24
+
+### Fixed (jvdd fork)
+
+- HA add-on install failed with `manifest unknown` for `ghcr.io/johanzander/bess-manager-aarch64:9.6.2-jvdd.1` — the johanzander GHCR registry does not publish jvdd tags. The `image:` field has been removed from `config.yaml` so the supervisor builds the image locally from the in-repo `Dockerfile` instead. First install takes a few minutes longer; subsequent updates are unaffected.
+
 ## [9.6.2-jvdd.1] - 2026-06-24
 
 Local fork build pulling in two pending upstream PRs ahead of merge.
