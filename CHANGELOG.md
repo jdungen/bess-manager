@@ -4,6 +4,12 @@ All notable changes to BESS Battery Manager will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [9.6.2-jvdd.3] - 2026-06-24
+
+### Fixed (jvdd fork)
+
+- HA add-on install failed with `dockerfile is missing` after removing `image:` in 9.6.2-jvdd.2 — the supervisor looks for `Dockerfile` inside the add-on directory (`bess_manager/`), but the Dockerfile lives at the repo root. Restored `image:` field pointing to the fork's own GHCR registry (`ghcr.io/jdungen/bess-manager-{arch}`) and updated the release workflow to use `github.repository_owner` so it publishes to the correct namespace on any fork.
+
 ## [9.6.2-jvdd.2] - 2026-06-24
 
 ### Fixed (jvdd fork)
