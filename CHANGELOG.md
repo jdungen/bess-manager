@@ -4,6 +4,18 @@ All notable changes to BESS Battery Manager will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [9.6.2-jvdd.1] - 2026-06-24
+
+Local fork build pulling in two pending upstream PRs ahead of merge.
+
+### Added (jvdd fork)
+
+- **`external_solar_mode`** battery setting for AC-coupled PV setups (upstream PR #167 / issue #162). When enabled, `SOLAR_STORAGE` periods use `grid_charge=True` so the battery can AC-charge from surplus solar that returns through the meter. Default `false` — DC-coupled installs see no change.
+
+### Fixed (jvdd fork)
+
+- Nord Pool currency auto-detect now covers continental day-ahead areas (NL/BE/DE/FR/AT/PL) — upstream PR #164 / issue #163. Without this, NL setups got locked to SEK because the Settings UI shows Currency as `readOnly` "Auto-detected…" and the discover map only knew SE/NO/DK/FI/EE/LT/LV/GB.
+
 ## [9.6.1] - 2026-06-21
 
 ### Fixed
