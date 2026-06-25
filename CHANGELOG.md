@@ -4,6 +4,12 @@ All notable changes to BESS Battery Manager will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [9.6.2-jvdd.5] - 2026-06-25
+
+### Fixed (jvdd fork)
+
+- **AI Analyst returned 404 for `claude-sonnet-4-20250514`** — the hardcoded Sonnet 4.0 / Opus 4.0 IDs from the May 2025 launch are deprecated and return `404 not_found_error` on some accounts ahead of the formal 2026-06-15 retirement. Updated default to `claude-sonnet-4-6` and Opus option to `claude-opus-4-8`; added `claude-haiku-4-5` to the dropdown. (upstream PR #180, still open)
+
 ## [9.6.2-jvdd.4] - 2026-06-24
 
 Rebased on upstream v9.6.2 (which already contains the NL/BE/DE/FR/AT/PL Nordpool fix from PR #164 — merged as 46b65ef). The fork now carries only the still-pending PR #167 patch.
