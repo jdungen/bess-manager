@@ -4,6 +4,12 @@ All notable changes to BESS Battery Manager will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [9.6.2-jvdd.6] - 2026-06-25
+
+### Fixed (jvdd fork)
+
+- **AI Analyst still 404'd after jvdd.5 when the broken ID was persisted** — the frontend swap alone left existing users stuck: `bess_settings.json` retained `claude-{sonnet,opus}-4-20250514`, the dropdown no longer offered those values, so the field couldn't be cleared through the UI. Added a startup `_migrate_schema` rewrite that maps the two retired IDs to their current replacements (`claude-sonnet-4-6` / `claude-opus-4-8`) on first load. (upstream PR #180 follow-up commit)
+
 ## [9.6.2-jvdd.5] - 2026-06-25
 
 ### Fixed (jvdd fork)
