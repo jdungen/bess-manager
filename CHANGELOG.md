@@ -4,6 +4,18 @@ All notable changes to BESS Battery Manager will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [9.6.2-jvdd.4] - 2026-06-24
+
+Rebased on upstream v9.6.2 (which already contains the NL/BE/DE/FR/AT/PL Nordpool fix from PR #164 — merged as 46b65ef). The fork now carries only the still-pending PR #167 patch.
+
+### Added (jvdd fork)
+
+- **`external_solar_mode`** battery setting (upstream PR #167, still open). When enabled, `SOLAR_STORAGE` periods use `grid_charge=True` so the battery can AC-charge from surplus solar that returns through the meter. Default `false` — DC-coupled installs see no change.
+
+### Fork build
+
+- `image:` points at `ghcr.io/jdungen/bess-manager-{arch}`; the release workflow uses `github.repository_owner` so it publishes to whichever fork it runs on. Triggerable via `workflow_dispatch` as well as on release publication.
+
 ## [Unreleased]
 
 ### Fixed
