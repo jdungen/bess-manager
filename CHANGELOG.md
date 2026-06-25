@@ -4,6 +4,12 @@ All notable changes to BESS Battery Manager will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [9.6.2-jvdd.7] - 2026-06-25
+
+### Fixed (jvdd fork)
+
+- **SolaxModbus + Growatt MID TOU begin/end writes silently dropped** — On Growatt MID 15KTL3-XH (and likely other MID models) the SolaxModbus integration exposes the time-slot begin/end as `select.*_inverter_time_N_begin/end`, but those entities are permanently `unavailable` with `restored:true` and the integration drops writes against them (HA returns success at the service layer, the inverter never receives the value). Net effect: the inverter kept whatever stale begin/end window was last in the register (e.g. 18:45-23:10), and outside that window it ran default Load First — completely ignoring BESS's planned mode. Workaround: after each select-write for begin/end, mirror the value to the parallel `time.*_time_N_begin/end` entity via `time.set_value`. That route works. The select-write is still attempted upstream so platforms where it works are unaffected. (upstream issue #181)
+
 ## [9.6.2-jvdd.6] - 2026-06-25
 
 ### Fixed (jvdd fork)
