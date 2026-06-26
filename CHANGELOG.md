@@ -6,6 +6,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ## [Unreleased]
 
+## [9.6.4-jvdd.1] - 2026-06-26
+
+Rebased on upstream v9.6.3 (which merged our PR #180 — the AI Analyst model-ID fix is now upstream and dropped from this fork's diff). Two jvdd-only patches remain:
+
+### Added (jvdd fork)
+
+- **`external_solar_mode`** battery setting for AC-coupled PV setups (upstream PR #167, still open). When enabled, `SOLAR_STORAGE` periods use `grid_charge=True` **and** TOU mode `battery_first` so the inverter actively pulls from the AC side during the planned solar window. The mode override is critical: with only `grid_charge=True` and TOU still in Load First, the Growatt EMS waits for a trigger that on AC-coupled never comes — battery sits idle even when solar surplus is flowing through the meter.
+
+### Fixed (jvdd fork)
+
+- **SolaxModbus + Growatt MID: TOU begin/end writes silently dropped** — on Growatt MID 15KTL3-XH the SolaxModbus integration's `select.*_inverter_time_N_begin/end` entities are permanently `unavailable` and writes get silently dropped, leaving the TOU slot stuck on a stale time window. The inverter then runs default Load First outside that window regardless of BESS's planned mode. After each select-write for begin/end, mirror the value to the parallel `time.*_time_N_begin/end` entity (which works). Mode/active writes go through select.* unchanged. (upstream issue #181)
+
 ## [9.6.3] - 2026-06-25
 
 ### Fixed
