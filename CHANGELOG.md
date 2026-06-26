@@ -4,6 +4,19 @@ All notable changes to BESS Battery Manager will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [9.6.3-jvdd.1] - 2026-06-25
+
+Minor-version bump above upstream v9.6.2. Bundles all fork changes accumulated since the rebase on 9.6.2 into one coherent release — easier to reference than the chain of jvdd.4–jvdd.7 patch builds. No code changes versus 9.6.2-jvdd.7; this is purely a relabel.
+
+### Added (jvdd fork)
+
+- **`external_solar_mode`** battery setting for AC-coupled PV setups (upstream PR #167, still pending). When enabled, `SOLAR_STORAGE` periods use `grid_charge=True` so the battery can AC-charge from surplus solar that returns through the meter. Default `false` — DC-coupled installs see no change.
+
+### Fixed (jvdd fork)
+
+- **AI Analyst returned 404 for `claude-sonnet-4-20250514` / `claude-opus-4-20250514`** — the hardcoded Claude 4.0 launch IDs from May 2025 are deprecated. Defaults updated to `claude-sonnet-4-6` (Sonnet 4.6) and `claude-opus-4-8` (Opus 4.8); added `claude-haiku-4-5` to the dropdown. Persisted legacy IDs in `bess_settings.json` are auto-migrated at startup. (upstream PR #180)
+- **SolaxModbus + Growatt MID: TOU begin/end writes silently dropped** — on Growatt MID 15KTL3-XH the SolaxModbus `select.*_inverter_time_N_begin/end` entities are permanently `unavailable` and writes get silently dropped, leaving the TOU slot stuck on a stale time window. The inverter then runs default Load First outside that window regardless of BESS's planned mode. After each select-write for begin/end, mirror the value to the parallel `time.*_time_N_begin/end` entity (which works). Mode/active writes go through select.* unchanged. (upstream issue #181)
+
 ## [9.6.2-jvdd.7] - 2026-06-25
 
 ### Fixed (jvdd fork)
