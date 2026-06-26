@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ## [Unreleased]
 
+## [9.6.4-jvdd.2] - 2026-06-26
+
+### Added (jvdd fork — experimental)
+
+- **Growatt VPP fast-path for AC-coupled** — When `external_solar_mode=True` and the Growatt VPP entities (`vpp_power`, `vpp_time`, `vpp_allow_ac_charging`) are configured, `SolaxModbusGrowattController` now bypasses TOU scheduling entirely and writes direct power commands via `number.<*>_vpp_power`. The intent → VPP mapping mirrors `SolaxController`. TOU slot 1 is explicitly disabled at startup so a stale slot can't fight the VPP command. DC-coupled installs (`external_solar_mode=False`) keep the TOU path. (upstream issue #118 — Johan's preferred direction; fork-only pending live-test then upstream PR.)
+
 ## [9.6.4-jvdd.1] - 2026-06-26
 
 Rebased on upstream v9.6.3 (which merged our PR #180 — the AI Analyst model-ID fix is now upstream and dropped from this fork's diff). Two jvdd-only patches remain:

@@ -1,6 +1,6 @@
 name: "BESS Manager"
 description: "Battery Energy Storage System optimization and management"
-version: "9.6.4-jvdd.1"
+version: "9.6.4-jvdd.2"
 slug: "bess_manager"
 image: "ghcr.io/jdungen/bess-manager-{arch}"
 init: false
