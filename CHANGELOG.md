@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ## [Unreleased]
 
+## [9.6.4-jvdd.5] - 2026-06-27
+
+### Fixed (jvdd fork)
+
+- **Growatt VPP commands ignored — `vpp_status` switch never written** — Even after the percent/minutes fix in jvdd.4, the inverter ignored BESS's VPP commands: `power=100%, ac_charging=Enabled` were dutifully written but `select.<*>_vpp_status` stayed at "Disabled" and the inverter kept following its default mode (TOU / self-use). Live-verified that flipping `vpp_status` to Enabled by hand makes the battery immediately charge at 12.4 kW. Fixed: `set_growatt_vpp` now writes `vpp_status=Enabled` as the last step (after power/time/ac_charging are coherent); `set_growatt_vpp_disabled` flips it back to Disabled. Sensor map + `_vpp_available` updated accordingly.
+
 ## [9.6.4-jvdd.4] - 2026-06-27
 
 ### Fixed (jvdd fork)
