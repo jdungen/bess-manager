@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ## [Unreleased]
 
+## [9.6.4-jvdd.6] - 2026-06-27
+
+### Fixed (jvdd fork)
+
+- **`external_solar_mode` and `vpp_mode` toggles reverted on restart** — Settings save (PATCH /api/settings) correctly pushed the toggles through to the live BatterySettings, but the startup path `build_system_settings()` filtered battery_config through `BATTERY_STORE_TO_API`, dropping any key not in that map. Both fork-only fields were silently stripped at boot and `BatterySettings.__init__` fell back to defaults (`False`). The toggle then *looked* On in the UI (loaded from `bess_settings.json`) while runtime was Off — fix-by-toggling-it-was-needed each restart. Added both keys to `BATTERY_STORE_TO_API`; the existing settings_store schema migration already populates them with default `False` on existing installs, so the startup required-field check still passes.
+
 ## [9.6.4-jvdd.5] - 2026-06-27
 
 ### Fixed (jvdd fork)
