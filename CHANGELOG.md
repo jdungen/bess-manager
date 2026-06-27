@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ## [Unreleased]
 
+## [9.6.4-jvdd.4] - 2026-06-27
+
+### Fixed (jvdd fork)
+
+- **Growatt VPP writes 500 — wrong unit for `vpp_power` / `vpp_time`** — `number.<*>_vpp_power` accepts a **percentage** of inverter nominal AC power (range −100..100, step 5), not watts. `number.<*>_vpp_time` is **minutes** (range 0..1440, step 5), not seconds. Writing 15000 (= max_charge_power_kw × 1000) returned `500 Internal Server Error` from the integration. Fixed: `set_growatt_vpp` now takes a `power_percent` argument (clamped to ±100, snapped to step 5) and writes `time` in minutes; `_apply_period_vpp` translates intent → ±100 or −discharge_rate (already a percentage).
+
 ## [9.6.4-jvdd.3] - 2026-06-27
 
 ### Added (jvdd fork — experimental)
