@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ## [Unreleased]
 
+## [9.6.4-jvdd.3] - 2026-06-27
+
+### Added (jvdd fork — experimental)
+
+- **VPP control mode is now an independent toggle** — previously the VPP fast-path was gated on `external_solar_mode=True`, conflating two orthogonal choices (AC-coupled PV behaviour vs control mechanism). Settings → Battery now has a second toggle "VPP control mode" in its own section. When enabled and the Growatt VPP entities are configured, BESS skips TOU scheduling and writes direct power commands; when disabled (or VPP entities missing), the existing TOU path is used. DC-coupled users can opt into VPP without flipping `external_solar_mode`; AC-coupled users can stay on TOU if they want.
+
 ## [9.6.4-jvdd.2] - 2026-06-26
 
 ### Added (jvdd fork — experimental)
