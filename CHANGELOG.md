@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ## [Unreleased]
 
+## [9.6.4-jvdd.7] - 2026-06-27
+
+### Fixed (jvdd fork)
+
+- **Growatt VPP needs a Disabled→Enabled edge to retrigger** — Live-verified on Growatt MID 15KTL3-XH: writing `vpp_status=Enabled` while the entity is already `Enabled` does not retrigger the inverter; the command sits in the buffer and the inverter keeps following its previous state. Only a real Disabled→Enabled transition activates the new command. `set_growatt_vpp` now always pre-arms by writing `vpp_status=Disabled` before the rest of the command, then ends with `Enabled` — guaranteeing an edge on every period boundary.
+
 ## [9.6.4-jvdd.6] - 2026-06-27
 
 ### Fixed (jvdd fork)
