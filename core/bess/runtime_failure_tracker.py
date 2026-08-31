@@ -29,6 +29,7 @@ class RuntimeFailure:
         category: Failure category for grouping (TOU_SEGMENT, POWER_RATE, etc.)
         operation: Human-readable operation description
         error_message: Full exception message for debugging
+        error_type: Exception class name, shown as the headline in the UI
         dismissed: Whether user has dismissed this notification
         context: Additional context data (segment_id, service params, etc.)
     """
@@ -38,6 +39,7 @@ class RuntimeFailure:
     category: str = ""
     operation: str = ""
     error_message: str = ""
+    error_type: str = ""
     dismissed: bool = False
     context: dict = field(default_factory=dict)
     occurrence_count: int = 1
@@ -82,6 +84,7 @@ class RuntimeFailureTracker:
             category=category,
             operation=operation,
             error_message=str(error),
+            error_type=type(error).__name__,
             context=context or {},
         )
 
@@ -121,6 +124,7 @@ class RuntimeFailureTracker:
                 if not failure.dismissed and failure.category == category:
                     failure.timestamp = datetime.now()
                     failure.error_message = str(error)
+                    failure.error_type = type(error).__name__
                     failure.occurrence_count += 1
                     if context:
                         failure.context = context
