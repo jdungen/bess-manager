@@ -4,6 +4,12 @@ All notable changes to BESS Battery Manager will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **Runtime error banners showed "Error: undefined" and hid their own diagnostics** — `RuntimeFailure` never carried an `error_type`, but the dashboard alert and the Report-a-Problem body both read one, so every runtime error rendered a literal `undefined` instead of the exception class. The alert also read `retry_count`, a field the backend does not have (it tracks `occurrence_count`), so a repeating failure always looked like a one-off. Worst of all, `_api_request` already captured the failing HA call's parameters and response body into `context` and nothing ever displayed it — a `500` from `nordpool.get_prices_for_date` reached the user with no indication of *why* Home Assistant returned 500. `error_type` is now recorded from the exception class, the occurrence count is shown once a failure repeats, and `context` is rendered in the expanded details and included in the problem report.
+
 ## [10.0.0-jvdd.1] - 2026-07-31
 
 Fork build: upstream **10.0.0** plus the two AC-coupled/NL patches this fork carries.
