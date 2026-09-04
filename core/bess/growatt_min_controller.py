@@ -214,7 +214,9 @@ class GrowattMinController(InverterController):
             return []
 
         def mode_at(period: int) -> str:
-            return self.INTENT_TO_MODE.get(intents[period], "load_first")
+            return self._effective_mode_for_intent(
+                intents[period], self.INTENT_TO_MODE.get(intents[period], "load_first")
+            )
 
         # Walk back over periods the running segment already covers.
         #
@@ -239,7 +241,9 @@ class GrowattMinController(InverterController):
 
         for period in range(start_period, num_periods):
             intent = intents[period]
-            mode = self.INTENT_TO_MODE.get(intent, "load_first")
+            mode = self._effective_mode_for_intent(
+                intent, self.INTENT_TO_MODE.get(intent, "load_first")
+            )
 
             if mode != current_mode:
                 # Save previous group if exists

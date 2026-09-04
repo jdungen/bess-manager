@@ -81,6 +81,7 @@ def _valid_options() -> dict:
             "charging_power_rate": 40,
             "efficiency_charge": 0.97,
             "efficiency_discharge": 0.95,
+            "external_solar_mode": False,
         },
         "home": {
             "default_hourly": 3.5,
@@ -100,6 +101,7 @@ def _valid_options() -> dict:
             "tax_reduction": 0.2,
             "spot_multiplier": 1.0175,
             "export_spot_multiplier": 1.018,
+            "sell_price_equals_buy_price": False,
             "use_actual_price": False,
         },
     }
@@ -346,6 +348,7 @@ _BATTERY_OPTIONAL_FIELDS = frozenset(
         "inverter_ac_power_margin",
         "export_curtailment_enabled",
         "export_curtailment_price_floor",
+        "external_solar_mode",
     }
 )
 # min_valid is an internal algorithm parameter, never read from the settings

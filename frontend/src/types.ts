@@ -127,6 +127,9 @@ export interface BatterySettings {
   exportCurtailmentEnabled: boolean;
   exportCurtailmentPriceFloor: number; // SEK/kWh — curtail below this sell price
 
+  // AC-coupled PV: route SOLAR_STORAGE through grid charging
+  externalSolarMode?: boolean;
+
   // Consumption estimate
   estimatedConsumption: number; // kWh daily estimate
   consumptionStrategy: string;  // "sensor", "fixed", or "influxdb_7d_avg"
@@ -140,6 +143,8 @@ export interface ElectricitySettings {
   vatMultiplier: number;
   additionalCosts: number;
   taxReduction: number;
+  // Net metering (e.g. NL saldering): sell price equals full buy price
+  sellPriceEqualsBuyPrice?: boolean;
   area: string;
 }
 

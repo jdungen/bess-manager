@@ -222,7 +222,7 @@ class InverterController(ABC):
         discharge_blocks: list[dict] = []
 
         for _category, target_list, intent_set in [
-            ("charge", charge_blocks, self.CHARGE_INTENTS),
+            ("charge", charge_blocks, self._effective_charge_intents()),
             ("discharge", discharge_blocks, self.DISCHARGE_INTENTS),
         ]:
             current_block: dict | None = None
@@ -520,6 +520,54 @@ class InverterController(ABC):
             )
         return control["charge_rate"]
 
+    def _effective_grid_charge(self, intent: str, grid_charge: bool) -> bool:
+        """Apply the external_solar_mode override for SOLAR_STORAGE.
+
+        On AC-coupled PV setups the battery inverter has no DC solar input,
+        so the only physical charging path is the grid (surplus solar
+        returns through the meter).  When external_solar_mode is enabled,
+        SOLAR_STORAGE periods must use grid_charge=True or the battery
+        sits idle the entire solar window.
+        """
+        if intent == "SOLAR_STORAGE" and self.battery_settings.external_solar_mode:
+            return True
+        return grid_charge
+
+    def _effective_mode_for_intent(self, intent: str, default_mode: str) -> str:
+        """Apply the external_solar_mode override for the battery mode.
+
+        For DC-coupled setups, Load First mode is correct for SOLAR_STORAGE
+        because the inverter naturally routes surplus solar (seen on its own
+        MPPT) to the battery.  On AC-coupled setups the battery inverter has
+        no DC solar input, so Load First mode produces no charging action
+        even with grid_charge enabled — the EMS waits for a trigger that
+        never comes.  Switching SOLAR_STORAGE to Battery First makes the
+        inverter actively charge from the AC side during the planned solar
+        window.
+
+        Trade-off: Battery First charges at the configured rate regardless
+        of actual solar surplus, so during a SOLAR_STORAGE period with
+        insufficient solar export the battery will draw from the grid.
+        BESS only plans SOLAR_STORAGE when the forecast shows surplus, so
+        the risk is bounded by forecast accuracy.
+        """
+        if intent == "SOLAR_STORAGE" and self.battery_settings.external_solar_mode:
+            return "battery_first"
+        return default_mode
+
+    def _effective_charge_intents(self) -> frozenset[str]:
+        """Intents that produce an AC charge period, honoring external_solar_mode.
+
+        Period-list platforms (SPH, Solis) exclude SOLAR_STORAGE from
+        CHARGE_INTENTS because a DC-coupled inverter charges from its own
+        MPPT without an explicit period.  On AC-coupled setups there is no
+        DC solar input, so SOLAR_STORAGE must become an AC charge period or
+        the battery never charges during the planned solar window.
+        """
+        if self.battery_settings.external_solar_mode:
+            return self.CHARGE_INTENTS | {"SOLAR_STORAGE"}
+        return self.CHARGE_INTENTS
+
     def _map_intent_to_rates(
         self, intent: str, battery_action_kw: float
     ) -> tuple[bool, int]:
@@ -535,7 +583,7 @@ class InverterController(ABC):
         if intent == "GRID_CHARGING":
             return True, 0
         elif intent == "SOLAR_STORAGE":
-            return False, 0
+            return self._effective_grid_charge(intent, False), 0
         elif intent in ("LOAD_SUPPORT", "BATTERY_EXPORT"):
             if battery_action_kw < -0.01:
                 discharge_rate = command_index(
@@ -664,7 +712,9 @@ class InverterController(ABC):
             )
         else:
             control = self.INTENT_TO_CONTROL[intent]
-            grid_charge = control["grid_charge"]
+            grid_charge = self._effective_grid_charge(
+                intent, bool(control["grid_charge"])
+            )
             charge_rate = control["charge_rate"]
             discharge_rate = control["discharge_rate"]
             block_passive_charging = control["charge_rate"] == 0
@@ -751,7 +801,11 @@ class InverterController(ABC):
             {} for period_list.
         """
         if self.CONTROL_MODEL == "tou_register":
-            return {"batt_mode": self.INTENT_TO_MODE[intent]}
+            return {
+                "batt_mode": self._effective_mode_for_intent(
+                    intent, self.INTENT_TO_MODE[intent]
+                )
+            }
 
         if self.CONTROL_MODEL == "vpp_power":
             # Every vpp_power controller must implement _vpp_display_state()
@@ -875,7 +929,10 @@ class InverterController(ABC):
             charge_rate = self._compute_charge_rate(intent, control, action_kw)
             block_passive_charging = control["charge_rate"] == 0
             mode_fields = self._mode_display_fields(
-                intent, control["grid_charge"], discharge_rate, block_passive_charging
+                intent,
+                self._effective_grid_charge(intent, bool(control["grid_charge"])),
+                discharge_rate,
+                block_passive_charging,
             )
 
             period_settings.append(
@@ -883,7 +940,9 @@ class InverterController(ABC):
                     "period": period,
                     "intent": intent,
                     **mode_fields,
-                    "grid_charge": control["grid_charge"],
+                    "grid_charge": self._effective_grid_charge(
+                        intent, bool(control["grid_charge"])
+                    ),
                     "charge_rate": charge_rate,
                     "discharge_rate": discharge_rate,
                     "action_kwh": action_kwh,
