@@ -20,6 +20,7 @@ const BASE_FORM: PricingForm = {
   taxReduction: 0,
   spotMultiplier: 1.0,
   exportSpotMultiplier: 1.0,
+  sellPriceEqualsBuyPrice: false,
 };
 
 describe('PricingFormSection', () => {
