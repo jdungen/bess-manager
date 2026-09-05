@@ -150,9 +150,13 @@ def test_scenarios_are_plan_faithful_realized_equals_planned():
     }
     # Tolerance reflects the DP's 0.1 kWh SoE-grid resolution: the plan trajectory
     # is reconstructed continuously, but the policy LOOKUP still snaps SoE to the
-    # grid, leaving a sub-öre-per-period residual on solar-storage days. The
-    # structural mismodels (phantom export, store/export collisions) are gone — a
-    # gap beyond this band would be a real finding.
+    # grid, leaving a sub-öre-per-period residual on solar-storage days.
+    #
+    # These two scenarios are 6 periods long, so a 0.10 SEK band is loose enough
+    # to hide a real per-period mismodel -- it did exactly that for #497, whose
+    # phantom export runs ~0.03 SEK/period. The corpus-wide pin in
+    # test_realized_matches_planned_across_all_fixtures is what actually
+    # constrains this; these two stay as a fast, readable smoke check.
     GRID_RESOLUTION_TOLERANCE = 0.10  # SEK, for these short scenarios
     for name, sc in scenarios.items():
         result, realized = run_scenario_realized(sc)
@@ -161,6 +165,147 @@ def test_scenarios_are_plan_faithful_realized_equals_planned():
             f"{name}: R={realized:.4f} != P={planned:.4f} "
             f"(gap {realized - planned:+.4f} exceeds grid-resolution tolerance)"
         )
+
+
+# Executing an optimizer plan must cost exactly what the optimizer said it
+# would. Not "within a tolerance" -- exactly.
+#
+# This was a 33-entry table of per-fixture gaps when it was written, totalling
+# 3.57 SEK of predicted savings the hardware could not deliver. #497 removed
+# the cause: the DP no longer proposes discharges the inverter cannot execute
+# as commanded, so there is nothing left for execution to diverge from and the
+# table collapsed to a single equality. Any future gap is a real finding, and
+# there is no band for one to hide in.
+PLAN_EXECUTION_TOLERANCE_SEK = 0.001  # float-accumulation slack only
+
+# The one surviving pinned gap, with a cause distinct from #497 (see TODO.md's
+# "From #502" entry): #507 stopped the *plan* charging the honest price for
+# periods BSM will curtail to zero at runtime, but the inverter simulator has
+# no model of PV export-limit curtailment, so *execution* still pays it. On
+# main this fixture pinned +0.0693 (that #502 share plus #497's +0.0490
+# phantom-export share); #497's fix removed its share, leaving exactly the
+# simulator's curtailment blindness. Goes to zero when the simulator learns
+# curtailment -- delete the entry then.
+KNOWN_PLAN_EXECUTION_GAP_SEK = {
+    # #502: simulator can't curtail. Re-measured at #512's finer grid (the
+    # curtailment-affected export volume shifts slightly with the plan);
+    # was +0.0203 under the 0.2 kW / 0.05 kWh grid.
+    "regression_2026_08_08_143843": +0.0214,
+    # `regression_2026_08_17_624`'s +0.0016 entry lived here between #629 and
+    # #630 and is now gone: that fixture's gap is +0.000000. The cause was not
+    # the SOE-grid snapping this entry described -- the forward replay carries
+    # continuous SoE, and period 32's SoE was held bit-exactly, which snapping
+    # would not produce. The DP was choosing the SOLAR_EXPORT-below-max bypass
+    # (#313) for a surplus too small to classify SOLAR_EXPORT, so the derived
+    # IDLE command absorbed what the plan exported. See
+    # `_solar_export_bypass_is_unexecutable` and
+    # `test_subfloor_solar_export_is_never_planned` below (#630).
+}
+
+
+@pytest.mark.slow
+def test_realized_matches_planned_across_all_fixtures():
+    """R == P exactly, on every fixture in the corpus.
+
+    `test_scenarios_are_plan_faithful_realized_equals_planned` above checks two
+    hand-built 6-period scenarios under a 0.10 SEK band -- loose enough that a
+    systematic per-period mismodel passes unnoticed, which is how #497 survived
+    for months. This runs the same comparison over every fixture in
+    `core/bess/tests/unit/data`, with no per-fixture exemptions: a new fixture
+    is covered the moment it is added, and cannot be quietly excluded.
+    """
+    from core.bess.tests.helpers import run_scenario_realized
+    from core.bess.tests.unit.test_scenarios import (
+        get_all_scenario_files,
+        load_test_scenario,
+    )
+
+    gaps = []
+    for name in sorted(get_all_scenario_files()):
+        result, realized = run_scenario_realized(load_test_scenario(name))
+        planned = result.economic_summary.battery_solar_cost
+        expected = KNOWN_PLAN_EXECUTION_GAP_SEK.get(name, 0.0)
+        if abs((realized - planned) - expected) > PLAN_EXECUTION_TOLERANCE_SEK:
+            gaps.append(
+                f"  {name}: R={realized:.4f} P={planned:.4f} "
+                f"(gap {realized - planned:+.4f} SEK, expected {expected:+.4f})"
+            )
+
+    assert not gaps, (
+        f"{len(gaps)} fixture(s) plan a cost their own execution does not "
+        f"reproduce. The optimizer is predicting savings the hardware cannot "
+        f"deliver:\n" + "\n".join(gaps)
+    )
+
+
+def test_subfloor_solar_export_is_never_planned():
+    """Regression for issue #630.
+
+    The DP offers a "hold SoE, export this period's own solar surplus"
+    candidate (the SOLAR_EXPORT-below-max bypass, #313). It is only executable
+    where `classify_strategic_intent` will actually label the period
+    SOLAR_EXPORT, because that intent is what writes charge rate 0 and stops
+    the inverter absorbing the surplus. Below the classifier's
+    `FLOW_NOISE_FLOOR_KWH`, the period falls through to IDLE instead, whose
+    command is `load_first` at charge rate 100 -- so the plan books export
+    revenue on energy the hardware puts in the battery. Same shape as #282 on
+    the discharge side, which `_residual_cover_p` already gates against.
+
+    The scenario is built to make the bypass the DP's honest choice, so the
+    plan is wrong for a real economic reason rather than by accident:
+
+    - period 0's surplus is 0.0099 kWh, just under the 0.01 kWh floor
+    - periods 1-2 carry enough surplus to fill the battery to `max_soe`
+      regardless, so the marginal value of storing period 0's surplus is only
+      the export it displaces later (sell 0.2), not its evening value
+    - selling it now at 0.5 therefore beats storing it, by more than the
+      cycle cost
+    - a larger discharge-and-refill at period 0 is unprofitable
+      (0.5 sell - 0.4 cycle - 0.2 displaced export < 0), so the DP has no
+      reason to reach for a discharge candidate instead
+
+    `terminal_value_per_kwh` is pinned to 0.0 so the leftover-SoE term cannot
+    quietly change which candidate wins as prices are tuned.
+
+    Measured on the pre-fix code: R=2.404206 P=2.401236, gap +0.002970 SEK --
+    three times `PLAN_EXECUTION_TOLERANCE_SEK`.
+    """
+    from core.bess.tests.helpers import run_scenario_realized
+
+    scenario = {
+        "buy_price": [1.2, 1.2, 1.2, 3.0, 3.0, 3.0],
+        "sell_price": [0.5, 0.2, 0.2, 0.2, 0.2, 0.2],
+        "solar_production": [0.5099, 2.0, 2.0, 0.0, 0.0, 0.0],
+        "home_consumption": [0.5, 0.5, 0.5, 6.0, 6.0, 6.0],
+        "battery": {
+            "max_soe_kwh": 20.0,
+            "min_soe_kwh": 2.2,
+            "max_charge_power_kw": 10.0,
+            "max_discharge_power_kw": 10.0,
+            "efficiency_charge": 0.97,
+            "efficiency_discharge": 0.97,
+            "cycle_cost_per_kwh": 0.40,
+            "initial_soe": 19.0,
+        },
+    }
+
+    result, realized = run_scenario_realized(scenario)
+    planned = result.economic_summary.battery_solar_cost
+
+    # The outcome that matters: executing this plan costs what it said it would.
+    assert abs(realized - planned) <= PLAN_EXECUTION_TOLERANCE_SEK, (
+        f"plan books a cost its own execution does not reproduce: "
+        f"R={realized:.6f} P={planned:.6f} gap={realized - planned:+.6f}"
+    )
+
+    # The mechanism, so a future regression is diagnosable and not just red:
+    # period 0 must absorb its sub-floor surplus, because that is what the
+    # command derived for it does.
+    p0 = result.period_data[0].energy
+    assert p0.grid_exported == pytest.approx(0.0, abs=1e-9), (
+        f"period 0 plans a {p0.grid_exported:.5f} kWh export below the "
+        f"classifier's noise floor -- the derived command absorbs it instead"
+    )
 
 
 def _battery(initial_soe):
@@ -460,7 +605,6 @@ def test_below_min_soe_charges_from_real_solar_instead_of_holding_at_negative_pr
         max_discharge_power_kw=5,
         charging_power_rate=40,
         cycle_cost_per_kwh=0.035,
-        min_action_profit_threshold=0,
         efficiency_charge=0.97,
         efficiency_discharge=0.95,
         inverter_max_ac_power_kw=0,
@@ -530,9 +674,11 @@ def test_load_support_self_throttles_discretization_overshoot():
     """#240 regression: load-first hardware never exports a discharge that
     overshoots home_consumption -- it self-throttles to the actual deficit,
     regardless of what a coarser discretized plan might have assumed. This
-    locks in the physical behavior the #240 reward-model fix
-    (core/bess/dp_battery_algorithm.py's _compute_reward) now assumes:
-    before that fix, the plan credited export revenue for energy that was
+    locks in the physical behavior the DP now accounts for by excluding
+    such discharges from its action set outright (#497,
+    core/bess/action_selector.py's _discharge_is_unexecutable; the
+    earlier #240 fix instead zeroed the export credit in _compute_reward):
+    before that, the plan credited export revenue for energy that was
     never actually exported, breaking R == P for these periods -- a case
     the existing hand-crafted plan-faithfulness scenarios were deliberately
     designed to avoid (see their own docstrings), so nothing else covers it.

@@ -32,7 +32,7 @@ export interface HourlyData {
   solarToHome?: FormattedValue;
   solarToBattery?: FormattedValue;
   solarToGrid?: FormattedValue;
-  clippedSolar?: FormattedValue; // solar lost to the inverter AC output cap
+  clippedSolar?: FormattedValue; // solar never delivered as AC export/consumption: inverter AC output cap, or curtailed by PV export-limit curtailment (#502)
   gridToHome?: FormattedValue;
   gridToBattery?: FormattedValue;
   batteryToHome?: FormattedValue;
@@ -41,6 +41,7 @@ export interface HourlyData {
   // Control and decision fields
   strategicIntent?: string;    // strategy name
   observedIntent?: string;     // what actually happened (set for past periods only)
+  curtailed?: boolean;         // planned PV curtailment, distinct from a profitable SOLAR_EXPORT
 
   // All user-facing data via FormattedValue - canonical naming
   buyPrice?: FormattedValue;
@@ -120,13 +121,18 @@ export interface BatterySettings {
   // Inverter AC output cap (solar clipping avoidance); 0 disables
   inverterMaxAcPowerKw: number;     // kW total AC output cap
   inverterAcPowerMargin: number; // 0-1 model-side haircut on the cap
-  
+
+  // PV export-limit curtailment (issue #269) — opt-in, requires a grid
+  // CT/smart meter and a platform with export-limit register support.
+  exportCurtailmentEnabled: boolean;
+  exportCurtailmentPriceFloor: number; // SEK/kWh — curtail below this sell price
+
   // AC-coupled PV: route SOLAR_STORAGE through grid charging
   externalSolarMode?: boolean;
 
   // Consumption estimate
   estimatedConsumption: number; // kWh daily estimate
-  consumptionStrategy: string;  // "sensor", "fixed", or "influxdb_7d_avg"
+  consumptionStrategy: string;  // "sensor", "fixed", "load_power_7d_avg", or "ha_statistics"
   
   // Price settings
   useActualPrice?: boolean;     // use actual vs estimated prices
@@ -282,9 +288,17 @@ export interface RuntimeFailure {
   operation: string;
   category: string;
   error_message: string;
-  error_type: string;
   occurrence_count: number;
-  context: Record<string, unknown>;
 }
+
+/**
+ * Which inverter control primitive the platform exposes for battery
+ * scheduling. Determines whether a discrete "battery mode" register is
+ * meaningful for display purposes (tou_register only) -- vpp_power and
+ * period_list installs have no such register.
+ * See docs/superpowers/specs/2026-07-29-control-model-display-design.md.
+ */
+export type ControlModel = 'tou_register' | 'vpp_power' | 'period_list';
+
 
 

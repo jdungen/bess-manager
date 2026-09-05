@@ -14,12 +14,14 @@ Coverage goals
 
 import sys
 from copy import deepcopy
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 from api import router
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+
+from core.bess.ha_api_controller import HomeAssistantAPIController
 
 # ---------------------------------------------------------------------------
 # Minimal FastAPI app that exercises the router under test
@@ -42,7 +44,6 @@ _DEFAULT_STORE: dict = {
         "cycle_cost_per_kwh": 0.5,
         "max_charge_power_kw": 15.0,
         "max_discharge_power_kw": 15.0,
-        "min_action_profit_threshold": 0.0,
         "charging_power_rate": 100,
         "efficiency_charge": 0.97,
         "efficiency_discharge": 0.97,
@@ -106,16 +107,16 @@ def mock_controller():
         result.update(sensors.get(platform, {}))
         return result
 
-    def _refresh_active_sensors() -> None:
-        active = _get_active_sensors()
-        ctrl.ha_controller.sensors = {k: v for k, v in active.items() if v}
-
     ctrl.settings_store.get_section.side_effect = _get_section
     ctrl.settings_store.save_section.side_effect = _save_section
     ctrl.settings_store.get_active_sensors.side_effect = _get_active_sensors
-    ctrl.refresh_active_sensors.side_effect = _refresh_active_sensors
 
-    ctrl.ha_controller.sensors = {}
+    # Real controller (not a further mock) so ha_controller.sensors is a
+    # live view over store_data, exactly like production (#334) — no
+    # refresh call needed between a settings PATCH and the assertion.
+    ctrl.ha_controller = HomeAssistantAPIController(
+        ha_url="http://ha.local", token="tok", settings_store=ctrl.settings_store
+    )
 
     sys.modules["app"].bess_controller = ctrl
     return ctrl
@@ -142,6 +143,16 @@ class TestGetSettings:
         # 30 kWh x 95% max_soc = 28.5 kWh
         assert battery["maxSoeKwh"] == pytest.approx(28.5)
         assert battery["reservedCapacity"] == pytest.approx(3.0)
+
+    def test_resolved_service_domain_exposed(self, mock_controller):
+        """The UI shows the platform default as a placeholder for the
+        inverter.service_domain override — it reads the resolved value from
+        the API rather than duplicating PLATFORM_SERVICE_DOMAIN client-side."""
+        mock_controller.settings_store.get_service_domain.return_value = (
+            "growatt_server"
+        )
+        resp = _client.get("/api/settings")
+        assert resp.json()["inverter"]["resolvedServiceDomain"] == "growatt_server"
 
     def test_sensors_come_from_store(self, mock_controller):
         """Sensor values are returned from the per-platform store structure."""
@@ -172,6 +183,19 @@ class TestGetSettings:
         battery = resp.json()["battery"]
         assert "totalCapacity" in battery
         assert "total_capacity" not in battery
+
+    def test_influxdb_config_present_reflects_helper(
+        self, mock_controller: MagicMock
+    ) -> None:
+        """The frontend deprecation banner (#722) keys off this flag — it must
+        mirror is_influxdb_configured()."""
+        with patch("api.is_influxdb_configured", return_value=True):
+            resp = _client.get("/api/settings")
+        assert resp.json()["influxdbConfigPresent"] is True
+
+        with patch("api.is_influxdb_configured", return_value=False):
+            resp = _client.get("/api/settings")
+        assert resp.json()["influxdbConfigPresent"] is False
 
 
 # ===========================================================================
@@ -272,6 +296,77 @@ class TestPatchSettingsInverter:
             },
         )
         mock_controller.system.switch_control_mode.assert_not_called()
+
+
+class TestPatchSettingsServiceDomain:
+    """inverter.service_domain overrides which HA integration domain vendor
+    service calls target (PR #412). It must persist, and the live controller
+    must pick it up without a restart — otherwise BESS keeps writing TOU
+    periods to the previous integration until the process is restarted."""
+
+    def test_service_domain_persisted(self, mock_controller):
+        _client.patch(
+            "/api/settings",
+            json={
+                "inverter": {
+                    "platform": "huawei_solar_luna2000",
+                    "serviceDomain": "huawei_emma_management",
+                }
+            },
+        )
+        assert (
+            mock_controller.settings_store.data["inverter"]["service_domain"]
+            == "huawei_emma_management"
+        )
+
+    def test_live_controller_refreshed(self, mock_controller):
+        _client.patch(
+            "/api/settings",
+            json={
+                "inverter": {
+                    "platform": "huawei_solar_luna2000",
+                    "serviceDomain": "huawei_emma_management",
+                }
+            },
+        )
+        mock_controller.refresh_service_domain.assert_called()
+
+
+class TestPatchSettingsServiceDomainValidation:
+    """The Settings UI edits this field via PATCH, not the wizard payload, so
+    the pydantic validator on APISetupCompletePayload never sees it. The value
+    is interpolated into /api/services/<domain>/<service> — a slash silently
+    retargets the request path."""
+
+    @pytest.mark.parametrize("bad", ["switch.foo", "my bridge", "a/b", "UPPER", "1abc"])
+    def test_malformed_domain_rejected(self, mock_controller, bad):
+        resp = _client.patch(
+            "/api/settings",
+            json={
+                "inverter": {"platform": "huawei_solar_luna2000", "serviceDomain": bad}
+            },
+        )
+        assert resp.status_code == 422, f"accepted malformed domain {bad!r}"
+
+    def test_empty_domain_accepted_as_reset_to_default(self, mock_controller):
+        resp = _client.patch(
+            "/api/settings",
+            json={
+                "inverter": {"platform": "huawei_solar_luna2000", "serviceDomain": ""}
+            },
+        )
+        assert resp.status_code == 200
+
+
+class TestPatchSettingsLegacyInverterType:
+    """The legacy growatt.inverterType path was removed — platform changes go
+    through the "inverter" section only. A stray legacy key must not switch
+    the live platform behind the store's back."""
+
+    def test_legacy_inverter_type_does_not_switch_platform(self, mock_controller):
+        resp = _client.patch("/api/settings", json={"growatt": {"inverterType": "SPH"}})
+        assert resp.status_code == 200
+        mock_controller.system.switch_inverter_platform.assert_not_called()
 
 
 class TestPatchSettingsCamelToSnake:
@@ -499,7 +594,6 @@ class TestPatchSettingsSensorValidation:
         mock_controller.settings_store.data["sensors"]["growatt_server_min"] = {
             "battery_soc": "sensor.existing"
         }
-        mock_controller.ha_controller.sensors = {"battery_soc": "sensor.existing"}
         _client.patch(
             "/api/settings",
             json={"sensors": {"growatt_server_min": {"battery_soc": ""}}},
@@ -513,10 +607,6 @@ class TestPatchSettingsSensorValidation:
     def test_clear_optional_sensor_removes_from_store(self, mock_controller):
         """Clearing an optional sensor (discharge_inhibit) removes it from storage."""
         mock_controller.settings_store.data["sensors"]["shared"] = {
-            "discharge_inhibit": "input_boolean.bess_discharge_inhibit",
-            "battery_soc": "sensor.battery_soc",
-        }
-        mock_controller.ha_controller.sensors = {
             "discharge_inhibit": "input_boolean.bess_discharge_inhibit",
             "battery_soc": "sensor.battery_soc",
         }
@@ -536,10 +626,6 @@ class TestPatchSettingsSensorValidation:
     def test_clear_phase_current_sensor_removes_from_store(self, mock_controller):
         """Clearing a phase current sensor removes it from both store and memory."""
         mock_controller.settings_store.data["sensors"]["shared"] = {
-            "phase_current_l3": "sensor.phase_l3",
-            "phase_current_l1": "sensor.phase_l1",
-        }
-        mock_controller.ha_controller.sensors = {
             "phase_current_l3": "sensor.phase_l3",
             "phase_current_l1": "sensor.phase_l1",
         }
@@ -576,6 +662,123 @@ class TestPatchSettingsSensorValidation:
         assert (
             mock_controller.ha_controller.sensors["grid_power"] == "sensor.grid_power"
         )
+
+
+# ===========================================================================
+# PATCH /api/settings — power monitoring sensor gating
+# ===========================================================================
+
+
+class TestPatchSettingsPowerMonitoringValidation:
+    """Enabling power monitoring via PATCH must be rejected server-side when
+    the phase-current sensors its phase_count requires aren't mapped — the
+    same gap that let power_monitoring_enabled=True crash-loop in production
+    (2026-08-07 debug bundle) because nothing validated it server-side."""
+
+    def test_rejects_power_monitoring_without_phase_sensors(self, mock_controller):
+        response = _client.patch(
+            "/api/settings",
+            json={"home": {"powerMonitoringEnabled": True, "phaseCount": 3}},
+        )
+        assert response.status_code == 422
+        detail = response.json()["detail"]
+        assert "current_l1" in detail or "phase" in detail.lower()
+        # The invalid combination must never be persisted, even though the
+        # request was rejected — a prior bug wrote power_monitoring_enabled
+        # to disk BEFORE running this validation, so the 422 error message
+        # was returned but the crash-loop-inducing config was still saved.
+        assert not mock_controller.settings_store.data["home"].get(
+            "power_monitoring_enabled"
+        )
+
+    def test_rejects_single_phase_without_l1_sensor(self, mock_controller):
+        response = _client.patch(
+            "/api/settings",
+            json={"home": {"powerMonitoringEnabled": True, "phaseCount": 1}},
+        )
+        assert response.status_code == 422
+
+    def test_allows_power_monitoring_when_phase_sensors_mapped(self, mock_controller):
+        mock_controller.settings_store.data["sensors"]["shared"] = {
+            "current_l1": "sensor.current_l1",
+            "current_l2": "sensor.current_l2",
+            "current_l3": "sensor.current_l3",
+            "battery_charging_power_rate": "sensor.charge_rate",
+        }
+        response = _client.patch(
+            "/api/settings",
+            json={"home": {"powerMonitoringEnabled": True, "phaseCount": 3}},
+        )
+        assert response.status_code == 200
+
+    def test_allows_disabling_power_monitoring_without_sensors(self, mock_controller):
+        """Turning power monitoring off must never be blocked by this check."""
+        response = _client.patch(
+            "/api/settings",
+            json={"home": {"powerMonitoringEnabled": False}},
+        )
+        assert response.status_code == 200
+
+
+# ===========================================================================
+# PATCH /api/settings — consumption strategy gating
+# ===========================================================================
+
+
+class TestPatchSettingsConsumptionStrategyValidation:
+    """Selecting the "sensor" consumption strategy without its sensor leaves
+    the system unable to build any schedule at all, so the dashboard never
+    leaves "Initializing" (#558). The UI hides the option, but PATCH is what
+    persists it, so the check has to exist here too."""
+
+    def test_rejects_sensor_strategy_without_its_sensor(self, mock_controller):
+        response = _client.patch(
+            "/api/settings",
+            json={"home": {"consumptionStrategy": "sensor"}},
+        )
+        assert response.status_code == 422
+        assert "48h_avg_grid_import" in response.json()["detail"]
+        # Never persisted — a rejected request must not leave the stalling
+        # config on disk.
+        assert (
+            mock_controller.settings_store.data["home"]["consumption_strategy"]
+            == "fixed"
+        )
+
+    def test_allows_sensor_strategy_when_its_sensor_is_mapped(self, mock_controller):
+        mock_controller.settings_store.data["sensors"]["shared"] = {
+            "48h_avg_grid_import": "sensor.avg_grid_import",
+        }
+        response = _client.patch(
+            "/api/settings",
+            json={"home": {"consumptionStrategy": "sensor"}},
+        )
+        assert response.status_code == 200
+
+    def test_rejects_unknown_strategy(self, mock_controller):
+        response = _client.patch(
+            "/api/settings",
+            json={"home": {"consumptionStrategy": "bogus_strategy"}},
+        )
+        assert response.status_code == 422
+
+    def test_rejects_unmapping_the_sensor_the_active_strategy_needs(
+        self, mock_controller
+    ):
+        """Removing 48h_avg_grid_import while the sensor strategy is active
+        breaks the system exactly as selecting the strategy without it does —
+        the same shape as the power-monitoring sensor-removal guard."""
+        mock_controller.settings_store.data["home"]["consumption_strategy"] = "sensor"
+        mock_controller.settings_store.data["sensors"]["shared"] = {
+            "48h_avg_grid_import": "sensor.avg_grid_import",
+        }
+
+        response = _client.patch(
+            "/api/settings",
+            json={"sensors": {"shared": {"48h_avg_grid_import": ""}}},
+        )
+
+        assert response.status_code == 422
 
 
 # ===========================================================================

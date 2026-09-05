@@ -20,6 +20,8 @@ from core.bess.models import (  # noqa: E402
     EnergyData,
     PeriodData,
 )
+from core.bess.settings_store import SettingsStore  # noqa: E402
+from core.bess.tests.helpers import empty_slot_table  # noqa: E402
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -57,9 +59,18 @@ class MockHomeAssistantController(HomeAssistantAPIController):
 
     def __init__(self) -> None:
         """Initialize with default settings."""
-        self.failure_tracker = None
-        self.growatt_device_id = None
-        self.sensors: dict[str, str] = {}
+        settings_store = SettingsStore()
+        settings_store.data["sensors"] = {
+            # SolaX VPP entity mappings (needed for entity resolution)
+            "solax_power_control_mode": "select.solax_remotecontrol_power_control",
+            "solax_active_power": "number.solax_remotecontrol_active_power",
+            "solax_autorepeat_duration": "number.solax_remotecontrol_autorepeat_duration",
+            "solax_power_control_trigger": "button.solax_remotecontrol_trigger",
+            "solax_battery_min_soc": "number.solax_battery_minimum_capacity",
+        }
+        super().__init__(
+            ha_url="http://mock", token="mock", settings_store=settings_store
+        )
         self.settings = {
             "grid_charge": False,
             "discharge_rate": 0,
@@ -93,17 +104,6 @@ class MockHomeAssistantController(HomeAssistantAPIController):
         self.solar_forecast = [0.0] * 96
         self.solar_forecast_tomorrow = [0.0] * 96
 
-        # SolaX VPP entity mappings (needed for entity resolution)
-        self.sensors.update(
-            {
-                "solax_power_control_mode": "select.solax_remotecontrol_power_control",
-                "solax_active_power": "number.solax_remotecontrol_active_power",
-                "solax_autorepeat_duration": "number.solax_remotecontrol_autorepeat_duration",
-                "solax_power_control_trigger": "button.solax_remotecontrol_trigger",
-                "solax_battery_min_soc": "number.solax_battery_minimum_capacity",
-            }
-        )
-
         # Configurable response for HA Statistics API mock
         self._statistics_response: dict = {}
 
@@ -127,8 +127,11 @@ class MockHomeAssistantController(HomeAssistantAPIController):
             "growatt_vpp_status": [],
             "growatt_vpp_allow_ac_charging": [],
             "growatt_vpp_periods": [],
+            "growatt_export_limit": [],
         }
+        self._growatt_export_limit_curtailed: bool = False
         self._growatt_vpp_status_state: str = "Disabled"
+        self._growatt_vpp_allow_ac_charging_state: str = "Disabled"
         self._growatt_vpp_remote_control_state: str | None = None
 
     # Required methods for Home Assistant Controller interface
@@ -253,8 +256,14 @@ class MockHomeAssistantController(HomeAssistantAPIController):
         return None
 
     def read_inverter_time_segments(self):
-        """Read current TOU segments from inverter."""
-        return []
+        """Read current TOU segments from inverter.
+
+        A MIN inverter always reports all 9 slots; unused ones come back
+        disabled. Returning [] would mean "read failed" to the controller
+        (see growatt_min_controller.sync_to_hardware), which is not what
+        an idle mock inverter represents.
+        """
+        return empty_slot_table()
 
     # Growatt solax_modbus TOU entity methods (used by SolaxModbusGrowattController)
 
@@ -360,6 +369,7 @@ class MockHomeAssistantController(HomeAssistantAPIController):
 
     def set_growatt_vpp_allow_ac_charging(self, enabled: bool) -> None:
         """Record Growatt VPP AC-charging write."""
+        self._growatt_vpp_allow_ac_charging_state = "Enabled" if enabled else "Disabled"
         self.calls["growatt_vpp_allow_ac_charging"].append(enabled)
 
     def set_growatt_vpp_period(
@@ -381,9 +391,18 @@ class MockHomeAssistantController(HomeAssistantAPIController):
         """Return mock Growatt VPP Status state."""
         return self._growatt_vpp_status_state
 
+    def set_growatt_export_limit(self, curtail: bool) -> None:
+        """Record Growatt export-limit curtailment write (#269)."""
+        self._growatt_export_limit_curtailed = curtail
+        self.calls["growatt_export_limit"].append(curtail)
+
     def get_growatt_vpp_remote_control(self) -> str | None:
         """Return mock Growatt VPP Remote Control state."""
         return self._growatt_vpp_remote_control_state
+
+    def get_growatt_vpp_allow_ac_charging(self) -> str | None:
+        """Return mock Growatt VPP allow-AC-charging state."""
+        return self._growatt_vpp_allow_ac_charging_state
 
     def get_statistics_during_period(
         self, statistic_ids, start_time, end_time=None, period="hour", types=None
@@ -646,15 +665,29 @@ def sample_solar_data():
 _DEFAULT_TEST_ADDON_OPTIONS: dict = {"inverter": {"platform": "growatt_server_min"}}
 
 
+def _warm_price_cache(system: BatterySystemManager) -> BatterySystemManager:
+    """Populate the price cache, mirroring BatterySystemManager.start().
+
+    Since #709 the quarterly optimizer reads prices cache-only (never fetches
+    on the scheduler thread); the running system warms the cache once at
+    startup. Fixtures that build a BSM directly must do the same or every
+    update_battery_schedule() call aborts at "No price data available".
+    """
+    system._price_manager.refresh_cache()
+    return system
+
+
 @pytest.fixture
 def base_system(mock_controller):
     """Provide a clean system instance with mock controller."""
     from core.bess.price_manager import MockSource
 
-    return BatterySystemManager(
-        controller=mock_controller,
-        price_source=MockSource([1.0] * 96),
-        addon_options=_DEFAULT_TEST_ADDON_OPTIONS,
+    return _warm_price_cache(
+        BatterySystemManager(
+            controller=mock_controller,
+            price_source=MockSource([1.0] * 96),
+            addon_options=_DEFAULT_TEST_ADDON_OPTIONS,
+        )
     )
 
 
@@ -779,7 +812,7 @@ def battery_system_integration(mock_controller, monkeypatch):
         addon_options=_DEFAULT_TEST_ADDON_OPTIONS,
     )
 
-    return system
+    return _warm_price_cache(system)
 
 
 @pytest.fixture
@@ -801,7 +834,7 @@ def battery_system_with_arbitrage(mock_controller, arbitrage_prices, monkeypatch
         addon_options=_DEFAULT_TEST_ADDON_OPTIONS,
     )
 
-    return system
+    return _warm_price_cache(system)
 
 
 @pytest.fixture(
@@ -833,7 +866,7 @@ def platform_system(request, mock_controller, arbitrage_prices, monkeypatch):
         price_source=price_source,
         addon_options=addon_options,
     )
-    return system
+    return _warm_price_cache(system)
 
 
 @pytest.fixture
@@ -898,7 +931,7 @@ def quarterly_battery_system(mock_controller, quarterly_arbitrage_prices, monkey
         addon_options=_DEFAULT_TEST_ADDON_OPTIONS,
     )
 
-    return system
+    return _warm_price_cache(system)
 
 
 # QUARTERLY RESOLUTION TEST UTILITIES

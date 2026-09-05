@@ -8,9 +8,7 @@ interface RuntimeFailure {
   operation: string;
   category: string;
   error_message: string;
-  error_type: string;
   occurrence_count: number;
-  context: Record<string, unknown>;
 }
 
 interface RuntimeFailureAlertsProps {
@@ -44,11 +42,6 @@ export const RuntimeFailureAlerts: React.FC<RuntimeFailureAlertsProps> = ({
       return timestamp;
     }
   };
-
-  const formatContext = (context: Record<string, unknown>) =>
-    Object.entries(context)
-      .map(([key, value]) => `${key}: ${typeof value === 'string' ? value : JSON.stringify(value)}`)
-      .join('\n');
 
   const getCategoryColor = (category: string) => {
     switch (category) {
@@ -104,7 +97,7 @@ export const RuntimeFailureAlerts: React.FC<RuntimeFailureAlertsProps> = ({
 
                 <div className="text-sm text-gray-600 mb-2">
                   <div>Time: {formatTimestamp(failure.timestamp)}</div>
-                  <div>Error: {failure.error_type}</div>
+                  <div>Error: {failure.error_message}</div>
                   {failure.occurrence_count > 1 && (
                     <div>Occurrences: {failure.occurrence_count}</div>
                   )}
@@ -116,14 +109,6 @@ export const RuntimeFailureAlerts: React.FC<RuntimeFailureAlertsProps> = ({
                     <pre className="mt-1 whitespace-pre-wrap font-mono text-xs">
                       {failure.error_message}
                     </pre>
-                    {Object.keys(failure.context).length > 0 && (
-                      <>
-                        <strong className="block mt-3">Context:</strong>
-                        <pre className="mt-1 whitespace-pre-wrap font-mono text-xs">
-                          {formatContext(failure.context)}
-                        </pre>
-                      </>
-                    )}
                   </div>
                 )}
               </div>
@@ -133,7 +118,7 @@ export const RuntimeFailureAlerts: React.FC<RuntimeFailureAlertsProps> = ({
                   onClick={() =>
                     openReportProblem({
                       title: `Runtime error: ${failure.operation}`,
-                      description: `Operation: ${failure.operation}\nCategory: ${failure.category}\nError type: ${failure.error_type}\nOccurrences: ${failure.occurrence_count}\nTime: ${formatTimestamp(failure.timestamp)}\n\n${failure.error_message}\n\n${formatContext(failure.context)}`,
+                      description: `Operation: ${failure.operation}\nCategory: ${failure.category}\nTime: ${formatTimestamp(failure.timestamp)}\n\n${failure.error_message}`,
                     })
                   }
                   className="flex items-center gap-1 text-gray-600 hover:text-blue-700 p-1 text-xs"

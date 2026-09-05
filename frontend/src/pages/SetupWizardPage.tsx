@@ -27,6 +27,18 @@ const CYCLE_COST_BY_CURRENCY: Record<string, number> = { SEK: 0.40, EUR: 0.035, 
 // "not yet user-configured" so a detected currency can safely replace them.
 const UNSET_CYCLE_COST_DEFAULTS = new Set([0.40, 0.50]);
 
+// The pricing field each provider cannot fetch a price without. Mirrors
+// backend/api.py's _PROVIDER_REQUIRED_FIELD, which rejects the same gap
+// server-side (#549). Without this gate the wizard completes with
+// provider=nordpool_official and an empty config entry whenever HA has no
+// Nord Pool integration, and every optimizer cycle then aborts.
+const PROVIDER_REQUIRED_FIELD: Record<string, keyof PricingForm> = {
+  nordpool_official: 'nordpoolConfigEntryId',
+  nordpool_hacs: 'nordpoolEntity',
+  octopus: 'octopusImportTodayEntity',
+  entsoe: 'entsoeEntity',
+};
+
 // ---------------------------------------------------------------------------
 // Component
 // ---------------------------------------------------------------------------
@@ -42,6 +54,10 @@ const SetupWizardPage: React.FC = () => {
   const [completeError, setCompleteError] = useState<string | null>(null);
   const [controlMode, setControlMode] = useState<'demo' | 'live' | null>(null);
   const existingSensorsRef = useRef<PerPlatformSensors>(emptyPerPlatformSensors());
+  // Only true on a genuinely new install (no prior setup) -- gates the
+  // fuse-protection auto-enable below so re-running the wizard on an
+  // already-configured system never overrides an explicit user choice.
+  const wizardNeededRef = useRef<boolean>(false);
 
   const [batteryForm, setBatteryForm] = useState<BatteryForm>({
     totalCapacity: 30.0,
@@ -52,9 +68,10 @@ const SetupWizardPage: React.FC = () => {
     efficiencyCharge: 97,
     efficiencyDischarge: 97,
     temperatureDeratingEnabled: false,
-    minActionProfit: 8.0,
     inverterMaxAcPowerKw: 0,
     inverterAcPowerMargin: 0.05,
+    exportCurtailmentEnabled: false,
+    exportCurtailmentPriceFloor: 0,
     externalSolarMode: false,
   });
 
@@ -63,15 +80,24 @@ const SetupWizardPage: React.FC = () => {
     deviceId: '',
     controlMode: 'tou',
   });
+  // handleScan has an empty dep list, so it cannot read inverterForm directly
+  // without capturing the initial render's value -- see the Re-scan comment in
+  // handleScan (#621). Mirror the selected platform into a ref so a re-scan
+  // that detects nothing falls back to what the user actually picked.
+  const selectedPlatformRef = useRef<string>(inverterForm.inverterPlatform);
+  selectedPlatformRef.current = inverterForm.inverterPlatform;
 
   const [homeForm, setHomeForm] = useState<HomeForm>({
     consumption: 3.5,
-    consumptionStrategy: 'sensor',
+    consumptionStrategy: 'fixed',
     maxFuseCurrent: 25,
     voltage: 230,
     safetyMarginFactor: 1.0,
     phaseCount: 3,
-    powerMonitoringEnabled: true,
+    // Turned on in handleScan only once its required sensors are actually
+    // detected on a new install -- see wizardNeededRef.
+    powerMonitoringEnabled: false,
+    managedLoadSensors: [],
   });
 
   const [pricingForm, setPricingForm] = useState<PricingForm>({
@@ -103,8 +129,13 @@ const SetupWizardPage: React.FC = () => {
       const d: DiscoveryResult = res.data;
       setDiscovery(d);
 
-      // Seed form defaults from auto-detected hints
-      if (d.detectedPhaseCount) {
+      // Seed form defaults from auto-detected hints. detectedPhaseCount is a
+      // raw count (0-3) of which current_l1/l2/l3 sensors were found — only
+      // 3 (all phases) or 1 (single phase, current_l1 only) map to a valid
+      // HomeSettings.phase_count (must be 1 or 3; see settings.py __post_init__).
+      // A partial 2-of-3 discovery is left at the existing/default phaseCount
+      // rather than seeding an invalid value.
+      if (d.detectedPhaseCount === 3 || d.detectedPhaseCount === 1) {
         setHomeForm(f => ({ ...f, phaseCount: d.detectedPhaseCount! }));
       }
       // Auto-select pricing provider based on discovered integrations.
@@ -166,7 +197,17 @@ const SetupWizardPage: React.FC = () => {
 
       // Build per-platform sensor structure from discovery results.
       // platformSensors has per-platform dicts; shared sensors come from d.sensors.
-      const platform = detectedPlatform ?? inverterForm.inverterPlatform ?? '';
+      //
+      // Read the selected platform through a ref, not the closure: handleScan
+      // has an empty dep list, so `inverterForm` here is the initial render's
+      // value. On a Re-scan that silently rewrote sensors.platform back to the
+      // default while inverterForm.inverterPlatform kept the user's choice —
+      // and the two are read by different things (allRequiredFilled resolves
+      // sensors via sensors.platform, the required-key list follows the
+      // selected tab), so once they diverged the sensor step could never be
+      // completed no matter what was typed. Hits exactly the user whose
+      // platform was never detected, who is the one most likely to Re-scan (#621).
+      const platform = detectedPlatform ?? selectedPlatformRef.current ?? '';
       const newSensors: PerPlatformSensors = emptyPerPlatformSensors(platform);
       const existing = existingSensorsRef.current;
 
@@ -203,6 +244,21 @@ const SetupWizardPage: React.FC = () => {
       }
 
       setSensors(newSensors);
+
+      // On a genuinely new install, pre-enable fuse protection once its
+      // required sensors are actually present -- never on a wizard re-run
+      // for an already-configured system, where this could silently
+      // override a choice the user already made.
+      const chargeRateSensorFound = !!getActiveSensorsFlat(newSensors).battery_charging_power_rate;
+      // Only auto-enable when EVERY phase sensor for the resolved phase count
+      // was found -- current_l1 alone (detectedPhaseCount >= 1) is not enough
+      // for a 3-phase install (see get_current_phase_loads_w, which crashes
+      // on a None current_l2/l3 read otherwise).
+      const allPhaseSensorsFound = d.detectedPhaseCount === 3 || d.detectedPhaseCount === 1;
+      if (wizardNeededRef.current && chargeRateSensorFound && allPhaseSensorsFound) {
+        setHomeForm(f => ({ ...f, powerMonitoringEnabled: true }));
+      }
+
       setStep(1);
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : 'Discovery failed';
@@ -213,10 +269,19 @@ const SetupWizardPage: React.FC = () => {
   }, []);
 
   useEffect(() => {
+    // Record whether this is a genuinely new install (no prior setup) before
+    // the settings/scan sequence below runs, so handleScan can gate the
+    // fuse-protection auto-enable on it. Awaited alongside the settings load
+    // (both feed into the same .finally() below) so it's always resolved
+    // before handleScan reads it.
+    const statusPromise = api.get('/api/setup/status').then(res => {
+      wizardNeededRef.current = !!res.data.wizardNeeded;
+    }).catch(() => {});
+
     // Load existing settings so re-running the wizard preserves user config,
     // then run the sensor scan. Sequencing via .finally() ensures the scan
     // never overwrites the loaded values (scan seeds only auto-detected hints).
-    api.get('/api/settings').then(res => {
+    const settingsPromise = api.get('/api/settings').then(res => {
       const s = res.data;
       const bat = s.battery ?? {};
       const home = s.home ?? {};
@@ -237,7 +302,6 @@ const SetupWizardPage: React.FC = () => {
         maxSoc:                   bat.maxSoc                   ?? f.maxSoc,
         maxChargeDischargePowerKw: bat.maxChargePowerKw        ?? f.maxChargeDischargePowerKw,
         cycleCostPerKwh:          bat.cycleCostPerKwh          ?? f.cycleCostPerKwh,
-        minActionProfit:          bat.minActionProfitThreshold ?? f.minActionProfit,
         efficiencyCharge:         bat.efficiencyCharge         ?? f.efficiencyCharge,
         efficiencyDischarge:      bat.efficiencyDischarge      ?? f.efficiencyDischarge,
         temperatureDeratingEnabled: bat.temperatureDeratingEnabled ?? f.temperatureDeratingEnabled,
@@ -252,6 +316,7 @@ const SetupWizardPage: React.FC = () => {
         safetyMarginFactor:     home.safetyMargin           ?? f.safetyMarginFactor,
         phaseCount:             home.phaseCount             ?? f.phaseCount,
         powerMonitoringEnabled: home.powerMonitoringEnabled ?? f.powerMonitoringEnabled,
+        managedLoadSensors:     home.managedLoadSensors     ?? f.managedLoadSensors,
       }));
       setPricingForm(f => ({
         ...f,
@@ -290,7 +355,9 @@ const SetupWizardPage: React.FC = () => {
       if (status !== 404) {
         console.error('Failed to load existing settings:', err);
       }
-    }).finally(() => {
+    });
+
+    Promise.all([statusPromise, settingsPromise]).finally(() => {
       handleScan();
     });
   }, [handleScan]);
@@ -327,7 +394,6 @@ const SetupWizardPage: React.FC = () => {
         maxSoc: batteryForm.maxSoc,
         maxChargeDischargePower: batteryForm.maxChargeDischargePowerKw,
         cycleCost: batteryForm.cycleCostPerKwh,
-        minActionProfitThreshold: batteryForm.minActionProfit,
         externalSolarMode: batteryForm.externalSolarMode,
         // Home
         currency: pricingForm.currency,
@@ -338,6 +404,7 @@ const SetupWizardPage: React.FC = () => {
         safetyMarginFactor: homeForm.safetyMarginFactor,
         phaseCount: homeForm.phaseCount,
         powerMonitoringEnabled: homeForm.powerMonitoringEnabled,
+        managedLoadSensors: homeForm.managedLoadSensors.filter(Boolean),
         // Electricity
         area: discovery.nordpoolArea || discovery.nordpoolCustomArea || pricingForm.area,
         provider: pricingForm.provider,
@@ -360,6 +427,7 @@ const SetupWizardPage: React.FC = () => {
         // Inverter
         inverterPlatform: inverterForm.inverterPlatform,
         inverterControlMode: inverterForm.controlMode ?? 'tou',
+        inverterServiceDomain: inverterForm.serviceDomain ?? '',
         // Control mode
         demoMode: controlMode === 'demo',
       });
@@ -390,6 +458,50 @@ const SetupWizardPage: React.FC = () => {
       group.sensors.every(s => !s.required || !!activeSensorsFlat[s.key]),
     );
   });
+
+  // Huawei LUNA2000 drives the device-targeted huawei_solar.set_tou_periods
+  // service, so a Device ID is mandatory — completing setup without one leaves
+  // write_huawei_tou_periods failing every cycle with nothing to target. It
+  // can be manually entered when auto-detection didn't surface one.
+  const huaweiDeviceIdMissing =
+    activeInverterIntegrationId === 'huawei_solar_luna2000'
+    && !inverterForm.deviceId.trim();
+
+  // Required sensors whose only HA entity is disabled (#549). The entity
+  // exists but has no state, so BESS cannot read it — the wizard must say
+  // "enable it", not "it's missing", and must not let setup complete with
+  // a mapping that is guaranteed to 404.
+  const requiredSensorKeys = new Set(
+    INTEGRATIONS.flatMap(integration => {
+      if (inverterIntegrationIds.has(integration.id) && integration.id !== activeInverterIntegrationId) return [];
+      return integration.sensorGroups.flatMap(group =>
+        group.sensors.filter(s => s.required).map(s => s.key),
+      );
+    }),
+  );
+  // Follow the selected inverter tab, not the auto-detected platform — a
+  // user with both a cloud and a modbus integration can switch between
+  // them, and each has its own set of disabled entities.
+  // platformDisabledSensors only has entries for platforms that were actually
+  // detected, so a miss means "this platform has no disabled entities" — never
+  // fall back to another platform's dict, or the tab would list entity IDs
+  // that belong to a different integration.
+  const activeDisabledSensors =
+    (discovery?.platformDisabledSensors
+      ? discovery.platformDisabledSensors[activeInverterIntegrationId]
+      : discovery?.disabledSensors)
+    ?? {};
+  // Compare against the entity ID, not mere presence: a user upgrading from an
+  // older wizard run already has the disabled entity persisted, and handleScan
+  // restores it from the saved settings. Presence alone would suppress the
+  // warning and re-persist the same 404-ing mapping (#549).
+  const disabledRequiredEntities = Object.entries(activeDisabledSensors)
+    .filter(([key, entityId]) =>
+      requiredSensorKeys.has(key)
+      && (!activeSensorsFlat[key] || activeSensorsFlat[key] === entityId));
+
+  const pricingRequiredField = PROVIDER_REQUIRED_FIELD[pricingForm.provider];
+  const pricingReady = !pricingRequiredField || !!pricingForm[pricingRequiredField];
 
   return (
     <div className="min-h-screen bg-gray-50 dark:bg-gray-900 flex flex-col items-center justify-center p-6">
@@ -475,9 +587,41 @@ const SetupWizardPage: React.FC = () => {
               discovery={discovery}
             />
 
-            {!allRequiredFilled && (
+            {disabledRequiredEntities.length > 0 && (
+              <div
+                data-testid="disabled-entities-warning"
+                className="p-3 bg-orange-50 dark:bg-orange-900/20 border border-orange-200 dark:border-orange-800 rounded-lg text-sm text-orange-700 dark:text-orange-300"
+              >
+                <p className="font-semibold">
+                  These entities exist in Home Assistant but are disabled:
+                </p>
+                <ul className="mt-1 ml-4 list-disc font-mono text-xs">
+                  {disabledRequiredEntities.map(([key, entityId]) => (
+                    <li key={key}>{entityId}</li>
+                  ))}
+                </ul>
+                <p className="mt-2">
+                  Enable them on the device page in Home Assistant, then press
+                  Re-scan. BESS cannot read a disabled entity, so leaving them
+                  off would report the system as degraded after setup.
+                </p>
+              </div>
+            )}
+
+            {!allRequiredFilled && disabledRequiredEntities.length === 0 && (
               <div className="p-3 bg-orange-50 dark:bg-orange-900/20 border border-orange-200 dark:border-orange-800 rounded-lg text-sm text-orange-700 dark:text-orange-300">
                 Some required sensors (marked with <span className="font-semibold">*</span>) are missing. Expand the integration to configure them manually.
+              </div>
+            )}
+
+            {huaweiDeviceIdMissing && (
+              <div
+                data-testid="huawei-device-id-warning"
+                className="p-3 bg-orange-50 dark:bg-orange-900/20 border border-orange-200 dark:border-orange-800 rounded-lg text-sm text-orange-700 dark:text-orange-300"
+              >
+                Enter the Huawei <span className="font-semibold">Device ID</span> for the battery.
+                It targets the <span className="font-mono">huawei_solar.set_tou_periods</span> service —
+                without it every schedule write fails.
               </div>
             )}
 
@@ -491,7 +635,7 @@ const SetupWizardPage: React.FC = () => {
               </button>
               <button
                 onClick={handleConfirm}
-                disabled={!allRequiredFilled}
+                disabled={!allRequiredFilled || disabledRequiredEntities.length > 0 || huaweiDeviceIdMissing}
                 className="flex items-center space-x-2 px-6 py-2 bg-blue-500 text-white rounded-lg hover:bg-blue-600 font-medium disabled:opacity-60"
               >
                 <span>Next: Electricity Pricing</span>
@@ -519,13 +663,26 @@ const SetupWizardPage: React.FC = () => {
 
             <PricingFormSection form={pricingForm} onChange={setPricingForm} />
 
+            {!pricingReady && (
+              <div
+                data-testid="pricing-incomplete-warning"
+                className="p-3 bg-orange-50 dark:bg-orange-900/20 border border-orange-200 dark:border-orange-800 rounded-lg text-sm text-orange-700 dark:text-orange-300"
+              >
+                This provider is selected but not configured, so BESS cannot
+                fetch any prices and the optimizer will not run. Fill in the
+                field above, or pick the provider you actually have installed
+                in Home Assistant.
+              </div>
+            )}
+
             <div className="flex justify-between pt-2">
               <button onClick={() => setStep(1)}
                 className="flex items-center space-x-1 px-4 py-2 text-gray-600 dark:text-gray-300 border border-gray-300 dark:border-gray-600 rounded-lg hover:bg-gray-50 dark:hover:bg-gray-700">
                 <ChevronLeft className="h-4 w-4" /><span>Back</span>
               </button>
               <button onClick={() => setStep(3)}
-                className="flex items-center space-x-2 px-6 py-2 bg-blue-500 text-white rounded-lg hover:bg-blue-600 font-medium">
+                disabled={!pricingReady}
+                className="flex items-center space-x-2 px-6 py-2 bg-blue-500 text-white rounded-lg hover:bg-blue-600 font-medium disabled:opacity-40 disabled:cursor-not-allowed">
                 <span>Next: Battery</span><ChevronRight className="h-4 w-4" />
               </button>
             </div>

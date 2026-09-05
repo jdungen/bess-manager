@@ -7,7 +7,7 @@ The values in this file serve as:
 2. Internal algorithm parameters not exposed to users
 
 All user-facing settings should be configured and overridden via config.yaml:
-- Battery settings (capacity, power, cycle_cost, min_action_profit_threshold)
+- Battery settings (capacity, power, cycle_cost)
 - Electricity price settings (area, markup_rate, vat_multiplier, additional_costs, tax_reduction)
 - Home settings (consumption, voltage, fuse_current, safety_margin_factor)
 
@@ -16,6 +16,8 @@ For production configuration, all user-facing values must be properly configured
 
 from dataclasses import dataclass, field, fields
 from typing import Any
+
+from .vpp_load_tracking import VPP_LOAD_TRACKING_TICK_SECONDS
 
 # Price settings defaults
 DEFAULT_AREA = ""
@@ -39,9 +41,6 @@ BATTERY_MIN_SOC = 10  # percentage
 BATTERY_MAX_SOC = 100  # percentage
 BATTERY_MAX_CHARGE_DISCHARGE_POWER_KW = 15.0
 BATTERY_CHARGE_CYCLE_COST = 0.40  # per kWh excl. VAT
-BATTERY_MIN_ACTION_PROFIT_THRESHOLD = (
-    0.0  # fixed minimum profit threshold for any battery action (0.0 for tests)
-)
 BATTERY_DEFAULT_CHARGING_POWER_RATE = 40  # percentage
 BATTERY_EFFICIENCY_CHARGE = 0.97  # Mix of solar (98%) and grid (95%) charging
 BATTERY_EFFICIENCY_DISCHARGE = 0.95  # DC-AC conversion losses
@@ -131,13 +130,20 @@ class BatterySettings:
     max_discharge_power_kw: float = BATTERY_MAX_CHARGE_DISCHARGE_POWER_KW
     charging_power_rate: float = BATTERY_DEFAULT_CHARGING_POWER_RATE
     cycle_cost_per_kwh: float = BATTERY_CHARGE_CYCLE_COST
-    min_action_profit_threshold: float = (
-        BATTERY_MIN_ACTION_PROFIT_THRESHOLD  # NEW FIELD
-    )
     efficiency_charge: float = BATTERY_EFFICIENCY_CHARGE
     efficiency_discharge: float = BATTERY_EFFICIENCY_DISCHARGE
     inverter_max_ac_power_kw: float = INVERTER_MAX_AC_POWER_KW
     inverter_ac_power_margin: float = INVERTER_AC_POWER_MARGIN
+    # PV export-limit curtailment (issue #269) — opt-in, requires a grid
+    # CT/smart meter and a platform with supports_export_limit_control.
+    export_curtailment_enabled: bool = False
+    export_curtailment_price_floor: float = 0.0
+    # VPP load tracking (#520) -- opt-in, Growatt VPP control mode only.
+    # Requires a resolvable local load sensor; opting in without one is a
+    # configuration error surfaced in health, never a quiet fall back to
+    # #413's release behaviour. See core/bess/vpp_load_tracking.py.
+    vpp_load_tracking_enabled: bool = False
+    vpp_load_tracking_tick_seconds: int = VPP_LOAD_TRACKING_TICK_SECONDS
     # AC-coupled PV opt-in: when True, SOLAR_STORAGE periods enable grid
     # charging so the battery can AC-charge from surplus solar that flows
     # back through the meter (no DC solar input on the battery inverter).
@@ -164,6 +170,19 @@ class BatterySettings:
         self.min_soe_kwh = self.total_capacity * self.min_soc / 100.0
         self.max_soe_kwh = self.total_capacity * self.max_soc / 100.0
         self.reserved_capacity = self.min_soe_kwh
+
+    def should_curtail_export(self, grid_exported: float, sell_price: float) -> bool:
+        """Core export-limit curtailment condition (#269).
+
+        Single source of truth shared by the DP's planning-time
+        decision.curtailed (#501, dp_battery_algorithm's _create_period_data)
+        and BSM's execution-time gate (_apply_period_schedule) — the two must
+        never diverge, or the UI's Curtailed display desyncs from actual
+        inverter behavior. Callers apply their own outer gates (the DP's
+        capability-aware export_curtailment_active, BSM's
+        export_curtailment_enabled + release latch).
+        """
+        return grid_exported > 0 and sell_price < self.export_curtailment_price_floor
 
     def update(self, **kwargs: Any) -> None:
         """Update settings from a snake_case dict — the store's native format.
@@ -196,12 +215,20 @@ class BatterySettings:
             self.cycle_cost_per_kwh = battery_config.get(
                 "cycle_cost_per_kwh", BATTERY_CHARGE_CYCLE_COST
             )
-            self.min_action_profit_threshold = battery_config.get(
-                "min_action_profit_threshold", BATTERY_MIN_ACTION_PROFIT_THRESHOLD
-            )
             self.external_solar_mode = battery_config.get("external_solar_mode", False)
             self.__post_init__()
         return self
+
+
+# Consumption-strategy ids that have been renamed. The old id is accepted
+# from persisted settings and API payloads and mapped to the current one so
+# existing installs keep working without a settings migration.
+_CONSUMPTION_STRATEGY_ALIASES = {"influxdb_7d_avg": "load_power_7d_avg"}
+
+
+def canonicalize_consumption_strategy(value: str) -> str:
+    """Map a legacy consumption-strategy id to its current name."""
+    return _CONSUMPTION_STRATEGY_ALIASES.get(value, value)
 
 
 @dataclass
@@ -215,14 +242,31 @@ class HomeSettings:
     default_hourly: float = HOME_HOURLY_CONSUMPTION_KWH
     min_valid: float = MIN_CONSUMPTION
     currency: str = DEFAULT_CURRENCY
-    consumption_strategy: str = "sensor"
+    consumption_strategy: str = "fixed"
     power_monitoring_enabled: bool = False
+    managed_load_sensors: list[str] = field(default_factory=list)
 
     def __post_init__(self):
         assert self.phase_count in (
             1,
             3,
         ), f"phase_count must be 1 or 3, got {self.phase_count}"
+        if self.power_monitoring_enabled:
+            if self.max_fuse_current <= 0:
+                raise ValueError(
+                    f"max_fuse_current must be positive when power_monitoring_enabled, "
+                    f"got {self.max_fuse_current}"
+                )
+            if self.voltage <= 0:
+                raise ValueError(
+                    f"voltage must be positive when power_monitoring_enabled, "
+                    f"got {self.voltage}"
+                )
+            if self.safety_margin <= 0:
+                raise ValueError(
+                    f"safety_margin must be positive when power_monitoring_enabled, "
+                    f"got {self.safety_margin}"
+                )
 
     def update(self, **kwargs: Any) -> None:
         """Update settings from a snake_case dict — the store's native format.
@@ -236,6 +280,8 @@ class HomeSettings:
         for key, value in kwargs.items():
             if key not in valid_fields:
                 raise AttributeError(f"HomeSettings has no attribute '{key}'")
+            if key == "consumption_strategy":
+                value = canonicalize_consumption_strategy(value)
             setattr(self, key, value)
         self.__post_init__()
 
@@ -255,8 +301,8 @@ class HomeSettings:
                 "consumption", HOME_HOURLY_CONSUMPTION_KWH
             )
             self.currency = config["home"].get("currency", DEFAULT_CURRENCY)
-            self.consumption_strategy = home_config.get(
-                "consumption_strategy", "sensor"
+            self.consumption_strategy = canonicalize_consumption_strategy(
+                home_config.get("consumption_strategy", "fixed")
             )
             self.power_monitoring_enabled = home_config["power_monitoring_enabled"]
             self.__post_init__()

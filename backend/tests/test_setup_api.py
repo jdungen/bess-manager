@@ -15,6 +15,8 @@ from api import router
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+from core.bess.ha_api_controller import HomeAssistantAPIController
+
 _test_app = FastAPI()
 _test_app.include_router(router)
 _client = TestClient(_test_app, raise_server_exceptions=False)
@@ -43,7 +45,6 @@ _PRE_EXISTING_STORE: dict = {
         "max_charge_power_kw": 5.0,
         "max_discharge_power_kw": 5.0,
         "cycle_cost_per_kwh": 0.3,
-        "min_action_profit_threshold": 0.0,
         "efficiency_charge": 0.97,
         "efficiency_discharge": 0.95,
         "temperature_derating": {"enabled": False, "weather_entity": ""},
@@ -81,7 +82,6 @@ def complete_controller():
     ctrl = MagicMock()
     store_data = deepcopy(_PRE_EXISTING_STORE)
     ctrl.settings_store.data = store_data
-    ctrl.ha_controller.sensors = {}
 
     def _get_section(name: str) -> dict:
         return dict(store_data.get(name, {}))
@@ -99,14 +99,17 @@ def complete_controller():
         result.update(sensors.get(platform, {}))
         return result
 
-    def _refresh_active_sensors() -> None:
-        active = _get_active_sensors()
-        ctrl.ha_controller.sensors = {k: v for k, v in active.items() if v}
-
     ctrl.settings_store.get_section.side_effect = _get_section
     ctrl.settings_store.save_all.side_effect = _save_all
     ctrl.settings_store.get_active_sensors.side_effect = _get_active_sensors
-    ctrl.refresh_active_sensors.side_effect = _refresh_active_sensors
+
+    # Real controller (not a further mock) so ha_controller.sensors is a
+    # live view over store_data, exactly like production (#334) — no
+    # refresh call needed between setup_complete persisting and the
+    # assertion.
+    ctrl.ha_controller = HomeAssistantAPIController(
+        ha_url="http://ha.local", token="tok", settings_store=ctrl.settings_store
+    )
 
     sys.modules["app"].bess_controller = ctrl
     return ctrl
@@ -125,7 +128,23 @@ def _full_wizard_payload(**overrides) -> dict:
             "solax_modbus_growatt_min": {},
             "solax_modbus_growatt_sph": {},
             "solax_modbus_native": {},
-            "shared": {},
+            # phaseCount defaults to 3 and powerMonitoringEnabled defaults to
+            # True below, so the phase-current sensors it requires must be
+            # mapped here too — otherwise the API's server-side validation
+            # (added to close the gap that let power_monitoring_enabled=True
+            # crash-loop without them, 2026-08-07) rejects every payload
+            # built from this base with a 422.
+            "shared": {
+                "current_l1": "sensor.current_l1",
+                "current_l2": "sensor.current_l2",
+                "current_l3": "sensor.current_l3",
+                "battery_charging_power_rate": "sensor.charge_rate",
+                # consumptionStrategy is "sensor" below, which has no
+                # fallback — without this sensor every optimization run
+                # aborts and the dashboard never leaves "Initializing", so
+                # the API rejects that combination with a 422 (#558).
+                "48h_avg_grid_import": "sensor.avg_grid_import",
+            },
         },
         "nordpoolArea": "SE4",
         "nordpoolConfigEntryId": "entry-abc",
@@ -135,7 +154,6 @@ def _full_wizard_payload(**overrides) -> dict:
         "maxSoc": 95.0,
         "maxChargeDischargePower": 15.0,
         "cycleCost": 0.50,
-        "minActionProfitThreshold": 8.0,
         "currency": "SEK",
         "consumption": 3.5,
         "consumptionStrategy": "sensor",
@@ -250,6 +268,7 @@ class TestSetupCompleteLegacy:
             json={
                 "sensors": {"battery_soc": "sensor.growatt_battery_soc"},
                 "provider": "nordpool_official",
+                "nordpoolConfigEntryId": "entry-abc",
                 "currency": "SEK",
                 "nordpoolArea": "SE4",
             },
@@ -270,6 +289,7 @@ class TestSetupCompleteLegacy:
             json={
                 "sensors": {},
                 "provider": "nordpool_official",
+                "nordpoolConfigEntryId": "entry-abc",
                 "totalCapacity": 30.0,
                 "minSoc": 15,
                 "maxSoc": 95,
@@ -347,7 +367,6 @@ class TestSetupComplete:
         assert bat["max_charge_power_kw"] == 15.0
         assert bat["max_discharge_power_kw"] == 15.0
         assert bat["cycle_cost_per_kwh"] == 0.50
-        assert bat["min_action_profit_threshold"] == 8.0
 
     def test_battery_preserves_keys_not_in_wizard(self, complete_controller):
         """Keys like efficiency_charge and temperature_derating must survive."""
@@ -383,6 +402,12 @@ class TestSetupComplete:
             "safetyMarginFactor": 1.0,
             "phaseCount": 3,
             "powerMonitoringEnabled": True,
+            "sensors": {
+                "current_l1": "sensor.current_l1",
+                "current_l2": "sensor.current_l2",
+                "current_l3": "sensor.current_l3",
+                "battery_charging_power_rate": "sensor.charge_rate",
+            },
         }
         resp = _client.post("/api/setup/complete", json=payload)
         assert resp.status_code == 200
@@ -416,6 +441,7 @@ class TestSetupComplete:
         """spotMultiplier/exportSpotMultiplier must reach electricity_price, not be dropped."""
         payload = _full_wizard_payload(
             provider="entsoe",
+            entsoeEntity="sensor.entsoe_average_electricity_price",
             spotMultiplier=1.0175,
             exportSpotMultiplier=1.018,
         )
@@ -518,6 +544,31 @@ class TestSetupComplete:
         assert call_args["inverter"]["platform"] == "huawei_solar_luna2000"
         assert call_args["inverter"]["device_id"] == "huawei-dev-456"
 
+    def test_service_domain_override_persisted(self, complete_controller):
+        """An install whose integration exposes the vendor services under its
+        own domain (e.g. huawei_emma_management, PR #412) configures that
+        here rather than needing a separate inverter platform."""
+        _client.post(
+            "/api/setup/complete",
+            json=_full_wizard_payload(
+                inverterPlatform="huawei_solar_luna2000",
+                inverterServiceDomain="huawei_emma_management",
+            ),
+        )
+        call_args = complete_controller.settings_store.save_all.call_args[0][0]
+        assert call_args["inverter"]["service_domain"] == "huawei_emma_management"
+
+    def test_malformed_service_domain_rejected(self, complete_controller):
+        """The value is interpolated into /api/services/<domain>/<service>."""
+        resp = _client.post(
+            "/api/setup/complete",
+            json=_full_wizard_payload(
+                inverterPlatform="huawei_solar_luna2000",
+                inverterServiceDomain="switch.some_entity",
+            ),
+        )
+        assert resp.status_code == 422
+
     def test_growatt_inverter_type_not_written(self, complete_controller):
         """Setup should not write legacy growatt.inverter_type for any platform."""
         # Clear pre-existing legacy field to verify setup doesn't add it
@@ -548,6 +599,63 @@ class TestSetupComplete:
             call_args["sensors"]["growatt_server_min"]["battery_soc"]
             == "sensor.growatt_battery_soc"
         )
+
+    def test_setup_complete_rejects_power_monitoring_without_phase_sensors(
+        self, complete_controller
+    ):
+        """Completing the wizard with power monitoring on but phase-current
+        sensors missing must fail with 422 — the server-side backstop for
+        the same gap that let power_monitoring_enabled=True crash-loop in
+        production (2026-08-07 debug bundle)."""
+        complete_controller.settings_store.data["sensors"] = {
+            "current_l1": "sensor.l1"  # L2/L3 missing
+        }
+        resp = _client.post(
+            "/api/setup/complete",
+            json={"powerMonitoringEnabled": True, "phaseCount": 3},
+        )
+        assert resp.status_code == 422
+
+    def test_setup_complete_accepts_power_monitoring_with_nested_shared_sensors(
+        self, complete_controller
+    ):
+        """A fresh install (empty settings store) submitting a realistic wizard
+        payload with current_l1/l2/l3 correctly mapped under sensors.shared —
+        the actual nested per-platform shape the real wizard always sends,
+        see APISetupCompletePayload.sensors — must succeed. This is the
+        golden path this whole plan exists to fix (Task 3's wizard
+        auto-enables power monitoring exactly like this). The validation must
+        flatten this nested shape via flatten_sensors(), not just check the
+        already-persisted store, otherwise a brand-new install would 422 on
+        its own first-ever setup_complete call."""
+        complete_controller.settings_store.data["sensors"] = {}
+        payload = _full_wizard_payload(
+            sensors={
+                "platform": "growatt_server_min",
+                "growatt_server_min": {
+                    "battery_soc": "sensor.growatt_battery_soc",
+                    "pv_power": "sensor.growatt_pv_power",
+                },
+                "growatt_server_sph": {},
+                "solax_modbus_growatt_min": {},
+                "solax_modbus_growatt_sph": {},
+                "solax_modbus_native": {},
+                "shared": {
+                    "current_l1": "sensor.current_l1",
+                    "current_l2": "sensor.current_l2",
+                    "current_l3": "sensor.current_l3",
+                    "battery_charging_power_rate": "sensor.charge_rate",
+                    # matches the base payload's "sensor" strategy (#558)
+                    "48h_avg_grid_import": "sensor.avg_grid_import",
+                },
+            },
+            powerMonitoringEnabled=True,
+            phaseCount=3,
+        )
+        resp = _client.post("/api/setup/complete", json=payload)
+        assert resp.status_code == 200
+        call_args = complete_controller.settings_store.save_all.call_args[0][0]
+        assert call_args["home"]["power_monitoring_enabled"] is True
 
     def test_rejects_invalid_sensor_entity_ids(self, complete_controller):
         payload = _full_wizard_payload(
@@ -601,6 +709,7 @@ class TestSetupComplete:
         default 1.0 until the addon restarts."""
         payload = _full_wizard_payload(
             provider="entsoe",
+            entsoeEntity="sensor.entsoe_average_electricity_price",
             spotMultiplier=1.0175,
             exportSpotMultiplier=1.018,
         )
@@ -692,8 +801,8 @@ class TestSetupComplete:
             == "sensor.growatt_battery_soc"
         )
 
-    def test_empty_sensor_values_filtered_from_live_sensors(self, complete_controller):
-        """Empty string sensors should not appear in the live ha_controller map."""
+    def test_empty_sensor_values_treated_as_unconfigured(self, complete_controller):
+        """An empty-string sensor entity resolves as not configured."""
         payload = _full_wizard_payload(
             sensors={
                 "platform": "growatt_server_min",
@@ -706,7 +815,9 @@ class TestSetupComplete:
             }
         )
         _client.post("/api/setup/complete", json=payload)
-        assert "pv_power" not in complete_controller.ha_controller.sensors
+        assert (
+            complete_controller.ha_controller.is_sensor_configured("pv_power") is False
+        )
 
     def test_growatt_device_id_applied_to_ha_controller(self, complete_controller):
         _client.post("/api/setup/complete", json=_full_wizard_payload())
@@ -818,7 +929,7 @@ class TestDiscoverLocaleDefaults:
         ha = ctrl.ha_controller
         ha.discover_integrations.return_value = (integrations, [])
         ha.fetch_entity_registry.return_value = [] if registry is None else registry
-        ha.discover_sensors_from_registry.return_value = ({}, None)
+        ha.discover_sensors_from_registry.return_value = ({}, None, {})
         ha.discover_current_sensors.return_value = {}
         ha.discover_optional_sensors.return_value = {}
         ha.discover_octopus_entities.return_value = {}
@@ -841,8 +952,8 @@ class TestDiscoverLocaleDefaults:
         ctrl = _make_discover_controller(store)
         integrations = {
             "growatt_found": False,
-            "device_sn": None,
             "growatt_device_id": None,
+            "huawei_found": False,
             "solax_found": False,
             "nordpool_found": False,
             "nordpool_area": None,
@@ -875,8 +986,8 @@ class TestDiscoverLocaleDefaults:
         ctrl = _make_discover_controller(store)
         integrations = {
             "growatt_found": False,
-            "device_sn": None,
             "growatt_device_id": None,
+            "huawei_found": False,
             "solax_found": False,
             "nordpool_found": True,
             "nordpool_area": "SE3",
@@ -909,8 +1020,8 @@ class TestDiscoverLocaleDefaults:
         ctrl = _make_discover_controller(store)
         integrations = {
             "growatt_found": False,
-            "device_sn": None,
             "growatt_device_id": None,
+            "huawei_found": False,
             "solax_found": False,
             "nordpool_found": True,
             "nordpool_area": "NO1",
@@ -940,8 +1051,8 @@ class TestDiscoverLocaleDefaults:
         ctrl = _make_discover_controller(store)
         integrations = {
             "growatt_found": False,
-            "device_sn": None,
             "growatt_device_id": None,
+            "huawei_found": False,
             "solax_found": False,
             "nordpool_found": False,
             "nordpool_area": None,
@@ -972,8 +1083,8 @@ class TestDiscoverLocaleDefaults:
         ctrl = _make_discover_controller(store)
         integrations = {
             "growatt_found": False,
-            "device_sn": None,
             "growatt_device_id": None,
+            "huawei_found": False,
             "solax_found": False,
             "nordpool_found": False,
             "nordpool_area": None,
@@ -1002,6 +1113,205 @@ class TestDiscoverLocaleDefaults:
         )
 
 
+class TestDiscoverForwardsInverterDetectionFlags:
+    """POST /api/setup/discover must forward a detection flag for EVERY
+    inverter platform the wizard shows (#621).
+
+    `discover_integrations()` produces `huawei_found`, but the endpoint
+    dropped it while forwarding the other three. The wizard's
+    `DiscoveryResult` declares `huaweiFound: boolean` (non-optional), so the
+    missing key surfaced as `undefined` rather than a type error, and the
+    Huawei detection dot read grey for every user including a correctly
+    detected stock `huawei_solar` install.
+
+    Asserting the flag on `discover_integrations()` alone is what let this
+    through — `test_scenario_discovery.py::...` already did that and passed.
+    The gap is in the endpoint's payload, so that is what these assert.
+    """
+
+    def _run_discover(self, ctrl, integrations):
+        ha = ctrl.ha_controller
+        ha.discover_integrations.return_value = (integrations, [])
+        ha.fetch_entity_registry.return_value = []
+        ha.discover_sensors_from_registry.return_value = ({}, None, {})
+        ha.discover_current_sensors.return_value = {}
+        ha.discover_optional_sensors.return_value = {}
+        ha.discover_octopus_entities.return_value = {}
+        ha.ENTITY_SUFFIX_MAP = {}
+        ha.SOLAX_GROWATT_MIN_SUFFIX_MAP = {}
+        ha.SOLAX_GROWATT_SPH_SUFFIX_MAP = {}
+        ha.SOLAX_NATIVE_SUFFIX_MAP = {}
+        sys.modules["app"].bess_controller = ctrl
+        return _client.post("/api/setup/discover")
+
+    @staticmethod
+    def _integrations(**overrides):
+        base = {
+            "growatt_found": False,
+            "growatt_device_id": None,
+            "huawei_found": False,
+            "huawei_device_id": None,
+            "solax_found": False,
+            "solis_found": False,
+            "nordpool_found": False,
+            "nordpool_area": None,
+            "nordpool_custom_area": None,
+            "nordpool_custom_entity": None,
+            "nordpool_config_entry_id": None,
+            "octopus_found": False,
+            "detected_inverter_platforms": [],
+            "detected_phase_count": None,
+            "currency": None,
+            "vat_multiplier": None,
+        }
+        base.update(overrides)
+        return base
+
+    def test_every_platform_detection_flag_is_present_in_the_payload(self):
+        """All four wizard platform tabs need their flag, not just three."""
+        ctrl = _make_discover_controller(deepcopy(_PRE_EXISTING_STORE))
+        resp = self._run_discover(ctrl, self._integrations())
+
+        assert resp.status_code == 200
+        body = resp.json()
+        for key in ("growattFound", "solaxFound", "solisFound", "huaweiFound"):
+            assert key in body, f"{key} missing from /api/setup/discover payload"
+
+    def test_detected_huawei_is_reported_as_found(self):
+        """A stock huawei_solar install must light the Huawei dot green."""
+        ctrl = _make_discover_controller(deepcopy(_PRE_EXISTING_STORE))
+        resp = self._run_discover(
+            ctrl,
+            self._integrations(
+                huawei_found=True,
+                huawei_device_id="dev-huawei-1",
+                detected_inverter_platforms=["huawei_solar_luna2000"],
+            ),
+        )
+
+        assert resp.status_code == 200
+        assert resp.json()["huaweiFound"] is True
+
+    def test_undetected_huawei_is_reported_as_not_found(self):
+        """The reporter's case: EMMA integration, so the flag is False --
+        False, not absent. The wizard must still be able to offer the tab.
+        """
+        ctrl = _make_discover_controller(deepcopy(_PRE_EXISTING_STORE))
+        resp = self._run_discover(ctrl, self._integrations(huawei_found=False))
+
+        assert resp.status_code == 200
+        assert resp.json()["huaweiFound"] is False
+
+
+class TestDiscoverReportsDisabledSensors:
+    """POST /api/setup/discover must tell the wizard which sensors are
+    unmapped because their entity is disabled in HA (#549).
+
+    Without this the wizard cannot distinguish "no such entity" from
+    "entity exists but is switched off", and the user is left to decode a
+    runtime 404 that claims the sensor is missing.
+    """
+
+    def _run_discover(self, ctrl, platform_sensors, platform_disabled, platform):
+        ha = ctrl.ha_controller
+        ha.discover_integrations.return_value = (
+            {
+                "growatt_found": False,
+                "growatt_device_id": None,
+                "huawei_found": False,
+                "solax_found": True,
+                "nordpool_found": False,
+                "nordpool_area": None,
+                "nordpool_custom_area": None,
+                "nordpool_custom_entity": None,
+                "nordpool_config_entry_id": None,
+                "octopus_found": False,
+                "detected_inverter_platforms": ["solax_modbus_growatt_min"],
+                "detected_phase_count": None,
+                "currency": None,
+                "vat_multiplier": None,
+            },
+            [],
+        )
+        ha.fetch_entity_registry.return_value = []
+        ha.discover_sensors_from_registry.return_value = (
+            platform_sensors,
+            platform,
+            platform_disabled,
+        )
+        ha.discover_current_sensors.return_value = {}
+        ha.discover_optional_sensors.return_value = {}
+        ha.discover_octopus_entities.return_value = {}
+        ha.SOLAX_GROWATT_MIN_SUFFIX_MAP = {"soc": "battery_soc"}
+        sys.modules["app"].bess_controller = ctrl
+        return _client.post("/api/setup/discover")
+
+    def test_disabled_sensors_returned_for_active_platform(self):
+        """The reporter's exact case: solax_modbus ships Total * disabled."""
+        ctrl = _make_discover_controller(deepcopy(_PRE_EXISTING_STORE))
+        disabled = {
+            "lifetime_import_from_grid": (
+                "sensor.solaxgrowatt_inverter_total_grid_import"
+            ),
+            "lifetime_export_to_grid": (
+                "sensor.solaxgrowatt_inverter_total_grid_export"
+            ),
+        }
+
+        resp = self._run_discover(
+            ctrl,
+            {"solax_modbus_growatt_min": {"battery_soc": "sensor.soc"}},
+            {"solax_modbus_growatt_min": disabled},
+            "solax_modbus_growatt_min",
+        )
+
+        assert resp.status_code == 200
+        assert resp.json()["disabledSensors"] == disabled
+
+    def test_disabled_sensors_returned_per_platform(self):
+        """The wizard lets the user switch inverter tabs, so the gate needs
+        every platform's disabled set — not just the auto-detected one.
+
+        The #549 reporter had both a Growatt cloud entry and a solax_modbus
+        entry, so this is their configuration, not a hypothetical.
+        """
+        ctrl = _make_discover_controller(deepcopy(_PRE_EXISTING_STORE))
+        per_platform = {
+            "solax_modbus_growatt_min": {
+                "lifetime_import_from_grid": "sensor.solax_total_grid_import"
+            },
+            "growatt_server_min": {
+                "lifetime_solar_energy": "sensor.growatt_total_solar"
+            },
+        }
+
+        resp = self._run_discover(
+            ctrl,
+            {
+                "solax_modbus_growatt_min": {"battery_soc": "sensor.soc"},
+                "growatt_server_min": {"battery_soc": "sensor.cloud_soc"},
+            },
+            per_platform,
+            "solax_modbus_growatt_min",
+        )
+
+        assert resp.status_code == 200
+        assert resp.json()["platformDisabledSensors"] == per_platform
+
+    def test_disabled_sensors_empty_when_everything_enabled(self):
+        ctrl = _make_discover_controller(deepcopy(_PRE_EXISTING_STORE))
+
+        resp = self._run_discover(
+            ctrl,
+            {"solax_modbus_growatt_min": {"battery_soc": "sensor.soc"}},
+            {"solax_modbus_growatt_min": {}},
+            "solax_modbus_growatt_min",
+        )
+
+        assert resp.status_code == 200
+        assert resp.json()["disabledSensors"] == {}
+
+
 class TestDiscoverPricingDefaults:
     """POST /api/setup/discover must suggest provider-aware pricing defaults.
 
@@ -1014,7 +1324,7 @@ class TestDiscoverPricingDefaults:
         ha = ctrl.ha_controller
         ha.discover_integrations.return_value = (integrations, [])
         ha.fetch_entity_registry.return_value = []
-        ha.discover_sensors_from_registry.return_value = ({}, None)
+        ha.discover_sensors_from_registry.return_value = ({}, None, {})
         ha.discover_current_sensors.return_value = {}
         ha.discover_optional_sensors.return_value = {}
         ha.discover_octopus_entities.return_value = {}
@@ -1028,8 +1338,8 @@ class TestDiscoverPricingDefaults:
     def _integrations(self, **overrides) -> dict:
         base = {
             "growatt_found": False,
-            "device_sn": None,
             "growatt_device_id": None,
+            "huawei_found": False,
             "solax_found": False,
             "nordpool_found": False,
             "nordpool_area": None,
@@ -1080,6 +1390,108 @@ class TestDiscoverPricingDefaults:
 # ===========================================================================
 # POST /api/setup/complete — demo mode TOU reinitialization
 # ===========================================================================
+
+
+class TestSetupCompleteRejectsUnusableProvider:
+    """POST /api/setup/complete must refuse a provider it cannot read prices
+    from (#549).
+
+    The reporter finished the wizard with provider=nordpool_official and an
+    empty config_entry_id because Home Assistant had no Nordpool integration
+    at all.  Every optimization cycle then aborted with "No price data
+    available".  Persisting that config is a silent failure — reject it.
+    """
+
+    @pytest.mark.parametrize(
+        ("provider", "overrides"),
+        [
+            ("nordpool_official", {"nordpoolConfigEntryId": ""}),
+            ("nordpool_hacs", {"nordpoolEntity": ""}),
+            ("entsoe", {"entsoeEntity": ""}),
+            ("octopus", {"octopusImportTodayEntity": ""}),
+        ],
+    )
+    def test_provider_without_its_required_config_is_rejected(
+        self, complete_controller, provider, overrides
+    ):
+        payload = _full_wizard_payload(provider=provider, **overrides)
+
+        resp = _client.post("/api/setup/complete", json=payload)
+
+        assert resp.status_code == 400
+        assert provider in resp.json()["detail"]
+        complete_controller.settings_store.save_all.assert_not_called()
+
+    def test_provider_with_its_required_config_is_accepted(self, complete_controller):
+        payload = _full_wizard_payload(
+            provider="nordpool_hacs", nordpoolEntity="sensor.nordpool_kwh_se4"
+        )
+
+        resp = _client.post("/api/setup/complete", json=payload)
+
+        assert resp.status_code == 200
+
+
+class TestSetupCompleteRejectsUnusableConsumptionStrategy:
+    """POST /api/setup/complete must refuse a consumption strategy it cannot
+    read a forecast from (#558).
+
+    The reporter's system had consumption_strategy="sensor" with no
+    48h_avg_grid_import entity. Every optimization run aborted, no schedule
+    was ever stored, and the dashboard sat on "Initializing" forever. The
+    frontend now hides that combination, but the API is what actually
+    persists it, so the guarantee has to live here too.
+    """
+
+    def _strip_48h(self, payload: dict) -> dict:
+        payload["sensors"]["shared"].pop("48h_avg_grid_import", None)
+        return payload
+
+    def test_sensor_strategy_without_its_sensor_is_rejected(self, complete_controller):
+        payload = self._strip_48h(_full_wizard_payload(consumptionStrategy="sensor"))
+
+        resp = _client.post("/api/setup/complete", json=payload)
+
+        assert resp.status_code == 422
+        assert "48h_avg_grid_import" in resp.json()["detail"]
+        complete_controller.settings_store.save_all.assert_not_called()
+
+    def test_sensor_strategy_with_its_sensor_is_accepted(self, complete_controller):
+        resp = _client.post(
+            "/api/setup/complete",
+            json=_full_wizard_payload(consumptionStrategy="sensor"),
+        )
+
+        assert resp.status_code == 200
+
+    @pytest.mark.parametrize(
+        "strategy",
+        ["fixed", "ha_statistics", "load_power_7d_avg", "influxdb_7d_avg"],
+    )
+    def test_other_strategies_do_not_need_that_sensor(
+        self, complete_controller, strategy
+    ):
+        """Only "sensor" has no fallback. ha_statistics and load_power_7d_avg
+        degrade to the fixed profile and report it, so rejecting them here
+        would invent a failure the optimizer does not have. The legacy id
+        ``influxdb_7d_avg`` is still accepted (normalised to
+        ``load_power_7d_avg``)."""
+        payload = self._strip_48h(_full_wizard_payload(consumptionStrategy=strategy))
+
+        resp = _client.post("/api/setup/complete", json=payload)
+
+        assert resp.status_code == 200
+
+    def test_unknown_strategy_is_rejected(self, complete_controller):
+        """An unrecognised value otherwise persists fine and only surfaces
+        later, as a ValueError from _get_consumption_forecast on every run."""
+        payload = _full_wizard_payload(consumptionStrategy="bogus_strategy")
+
+        resp = _client.post("/api/setup/complete", json=payload)
+
+        assert resp.status_code == 422
+        assert "bogus_strategy" in resp.json()["detail"]
+        complete_controller.settings_store.save_all.assert_not_called()
 
 
 class TestSetupCompleteDemoMode:

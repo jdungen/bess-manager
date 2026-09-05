@@ -25,13 +25,14 @@ Both additions are **opt-in switches, default OFF** — with them off the build 
 | **`external_solar_mode`** battery setting | On AC-coupled installs the Growatt has no DC solar input — without this, `SOLAR_STORAGE` periods do nothing. The flag flips `grid_charge=True` *and* the battery mode → `battery_first`, and makes `SOLAR_STORAGE` produce a real TOU/charge period, so the inverter actively pulls from the AC side during the planned solar window. | [PR #167](https://github.com/johanzander/bess-manager/pull/167) — open |
 | **`sell_price_equals_buy_price`** price setting | Under net metering (Dutch *saldering*, in force through 2026) every exported kWh offsets an imported one on the bill, so its value is the full buy price — not `spot + export compensation`. Without this the optimizer undervalues exports and skews charge/discharge decisions. | not upstream |
 
-### Previously fork-only, now upstream in 10.0.0
+### Previously fork-only, now upstream
 
 These patches were carried by earlier `9.6.x-jvdd.N` builds and have since landed upstream — the fork no longer duplicates them:
 
 - **Growatt VPP control** — now a first-class upstream feature via **Settings → Inverter → Control Mode = VPP** ([#118](https://github.com/johanzander/bess-manager/issues/118)). The old fork-local `vpp_mode` battery toggle is gone; use upstream's Control Mode instead.
 - **SolaxModbus TOU begin/end writes** via the `time.*` entities ([#362](https://github.com/johanzander/bess-manager/issues/362), [#181](https://github.com/johanzander/bess-manager/issues/181)).
 - AI Analyst model IDs and Nord Pool continental area hints (merged back in 9.6.3).
+- **Runtime error banner diagnostics** — carried by `10.0.0-jvdd.2`; upstream 10.1.0 fixes the same defect its own way (`occurrence_count` + `error_message`), so the fork patch is dropped.
 
 ### Settings — fork-only toggles
 
@@ -88,7 +89,7 @@ Something look off? The built-in AI Analyst explains every decision in plain lan
 | **Resolution** | 15-minute granularity (Nordpool) or 30-minute (Octopus) |
 | **Solar aware** | Integrates solar forecast to maximize self-consumption |
 | **Battery protection** | Models cycle degradation cost — won't chase marginal gains that wear out your battery |
-| **Fuse protection** | Monitors grid current and limits charging to prevent overloading your main fuse |
+| **Fuse protection** | Plans schedules and monitors real-time grid current to keep charging within your main fuse's limit |
 | **EV aware** | Automatically pauses battery discharge when your EV is charging |
 | **Re-optimization** | Continuously updates as prices, solar, and consumption data change |
 | **AI Analyst** | Chat with your battery system — ask questions, get explanations |
@@ -99,20 +100,20 @@ Something look off? The built-in AI Analyst explains every decision in plain lan
 - **Growatt MIC/MIN/MOD/MID** — via Growatt Server (cloud) or Modbus (local, TOU or VPP control mode *(VPP experimental)*)
 - **Growatt SPH** — via Growatt Server (cloud) or Modbus (local, VPP control mode *(experimental)*)
 - **SolaX** — via Solax modbus integration
-- **Solis** — via the [solis_modbus](https://github.com/Pho3niX90/solis_modbus) integration (local Modbus) *(experimental)*
+- **Solis** — via the [solis_modbus](https://github.com/Pho3niX90/solis_modbus) integration (local Modbus)
 - **Huawei LUNA2000** *(experimental)* — via huawei_solar integration (local Modbus)
 
 ### Electricity Markets
 - **Nordpool** — Nordic spot market (SE, NO, FI, DK, EE, LT, LV)
 - **Octopus Energy Agile** — UK market with separate import/export rates
-- **ENTSO-e / Belpex** — European day-ahead spot prices via the ENTSO-e Transparency Platform (e.g. Belgian Belpex) *(experimental)*
+- **ENTSO-e / Belpex** — European day-ahead spot prices via the ENTSO-e Transparency Platform (e.g. Belgian Belpex)
 
 ### Optional Integrations
 - **Solcast** or other solar forecast for production predictions
 - **InfluxDB** for historical data persistence
 - **Tibber** for power monitoring
 
-> **Want support for your inverter?** We're actively looking for testers with GivEnergy, Solis, Huawei, and other systems. [Open an issue](https://github.com/johanzander/bess-manager/issues) or join the discussion! [Sponsoring](https://github.com/johanzander/bess-manager#sponsorship) helps prioritize new hardware support.
+> **Want support for your inverter?** We're actively looking for testers with GivEnergy, Huawei, and other systems. [Open an issue](https://github.com/johanzander/bess-manager/issues) or join the discussion! [Sponsoring](https://github.com/johanzander/bess-manager#sponsorship) helps prioritize new hardware support.
 
 ## Installation
 

@@ -39,7 +39,7 @@ logger = logging.getLogger(__name__)
 class SolaxController(InverterController):
     """SolaX inverter controller using VPP active-power commands.
 
-    SolaX does not use a persistent TOU schedule.  ``write_to_hardware``
+    SolaX does not use a persistent TOU schedule.  ``sync_to_hardware``
     is a no-op; the actual hardware writes happen period-by-period via
     ``_write_period_to_hardware``, called from
     ``BatterySystemManager._apply_period_schedule``.
@@ -54,6 +54,14 @@ class SolaxController(InverterController):
     # immediate forced watt-level command (_write_period_to_hardware),
     # never a load-following ceiling. See #324.
     discharge_rate_is_load_following: ClassVar[bool] = False
+
+    # LOAD_SUPPORT is a forced -(rate% x max_discharge) here: SolaX never
+    # received the #413 remote-control release that makes solax_modbus's VPP
+    # mode load-follow that intent (see _vpp_display_state's gap note), so a
+    # planned partial cover is NOT delivered as min(plan, actual load).
+    load_support_delivers_exact_cover: ClassVar[bool] = False
+
+    CONTROL_MODEL: ClassVar[str] = "vpp_power"
 
     def __init__(self, battery_settings: BatterySettings) -> None:
         """Initialise the SolaX controller."""
@@ -150,11 +158,43 @@ class SolaxController(InverterController):
             logger.error("FAILED: SolaX VPP period write: %s", e)
             return False, str(e)
 
-    def write_to_hardware(
+    def _vpp_display_state(
+        self,
+        grid_charge: bool,
+        discharge_rate: int,
+        block_passive_charging: bool = False,
+        strategic_intent: str = "",
+        at_reserve_floor: bool = False,
+    ) -> tuple[int, bool]:
+        """Map (grid_charge, discharge_rate) to (power_pct, remote_control_enabled)
+        for display, mirroring _write_period_to_hardware()'s three branches
+        exactly. Unlike SolaxModbusGrowattController._intent_to_vpp(), this
+        ignores block_passive_charging and strategic_intent -- SolaX's
+        actual hardware write logic doesn't use them either (see the
+        TODO.md gap note: SolaX never received the #355/#413 Growatt VPP
+        fixes, so its real behavior for SOLAR_EXPORT/LOAD_SUPPORT differs).
+        The extra parameters exist only so the base class's
+        _mode_display_fields() can call _vpp_display_state() with a single
+        unified signature across all vpp_power controllers -- they do not
+        change SolaxController's own behavior. at_reserve_floor (#592) is in
+        that same category: native SolaX never received the Growatt VPP IDLE
+        hold (#466) that #592 releases, so there is nothing here to release.
+
+        Returns:
+            (power_pct, remote_control_enabled) -- power_pct expressed as a
+            percent of max charge/discharge power, matching discharge_rate's
+            own convention (not raw watts).
+        """
+        if not grid_charge and discharge_rate == 0:
+            return 0, False
+        if grid_charge:
+            return 100, True
+        return -discharge_rate, True
+
+    def sync_to_hardware(
         self,
         controller,
         effective_period: int,
-        current_tou: list,
     ) -> tuple[int, int]:
         """No-op for SolaX — schedule is applied period-by-period via VPP.
 
@@ -164,7 +204,7 @@ class SolaxController(InverterController):
         Returns:
             (0, 0) — no writes or disables performed.
         """
-        logger.debug("SolaX: write_to_hardware is a no-op (per-period VPP)")
+        logger.debug("SolaX: sync_to_hardware is a no-op (per-period VPP)")
         return 0, 0
 
     def initialize_hardware(self, controller) -> None:
@@ -355,7 +395,6 @@ class SolaxController(InverterController):
                     "segment_id": 0,
                     "start_time": "00:00",
                     "end_time": "23:59",
-                    "batt_mode": "load_first",
                     "enabled": False,
                     "is_default": True,
                 }
@@ -368,7 +407,8 @@ class SolaxController(InverterController):
                     "segment_id": i,
                     "start_time": group["start_time"],
                     "end_time": group["end_time"],
-                    "batt_mode": group["mode"],
+                    "vpp_power_pct": group["vpp_power_pct"],
+                    "vpp_remote_control": group["vpp_remote_control"],
                     "enabled": True,
                     "strategic_intent": group["intent"],
                 }

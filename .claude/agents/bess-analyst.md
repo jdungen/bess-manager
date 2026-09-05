@@ -1,6 +1,7 @@
 ---
 name: bess-analyst
 description: Analyze BESS issues, debug problems, and explain system behavior. Use when investigating savings calculations, optimization decisions, or schedule issues.
+color: cyan
 tools: Read, Grep, Glob, Bash, WebFetch
 ---
 
@@ -73,6 +74,84 @@ latest-run `SOLAR_EXPORT`). Never conclude "it didn't happen / the battery doesn
 move." Explain where it happened and WHY runs differ (usually near-threshold
 `shadow_price` volatility).
 
+**Where cross-run data actually lives (a recurring mistake — read this before
+concluding "only the latest run is available"):**
+
+| Section | Coverage | Precision |
+|---|---|---|
+| `## Prediction Snapshots` (`predicted_periods_delta` per snapshot) | **The authoritative multi-run source.** Every optimization run of the day, each with its own forward-looking forecast: every period with `data_source == "predicted"` at that run's own decision time (its exact `optimize_battery_schedule()` horizon input — buy/sell price, solar, consumption, SOE, shadow_price, intent), plus the run's total predicted savings. Already-realized periods are deliberately excluded from each snapshot (they're in Historical Sensor Data instead, once, not repeated per run). Since #555 each snapshot carries a **delta**, not a whole forecast: `predicted_periods_delta` is a **field-level** delta: for each period that moved since the previous snapshot, only the fields that moved (decision, energy or economics — a period's SOE and costs move when the DP changes *other* periods, so this is not just intent/battery_action), plus `period` to key it. A period's first appearance carries its complete payload. `predicted_periods_dropped` lists the period indices that left the forecast that cycle (they realized into actuals). To reconstruct any run's complete forecast, walk the snapshots in order, **deep-merging** each delta entry into the accumulated state for its `period` and deleting the dropped indices. Do not read a delta entry as if it were a whole period — a missing `strategic_intent` means "unchanged", never "none". `scripts/extract_decision_evidence.py` already does this replay for you. An empty delta means the plan didn't move that cycle. Added in #481; bundles exported before that fix only have the 5-field summary row (timestamp/period/total_savings/actual_count/predicted_count), no periods. Bundles between #481 and #555 use `predicted_periods` (whole forecast, present only on runs where something changed) — the key name tells you which encoding you have. | **Exact** — the real optimizer input, not a rounded log line. |
+| `## Raw Schedule JSON (deep debugging)` | **Only the latest optimization run** — full `input_data`/`period_data`, every period in the horizon, exact floats. Its `<summary>` label reports the true run count and mode (fixed in #481 — was previously a hardcoded, misleading "(all runs)"); count the top-level array entries before assuming a bundle has more than one. | Exact |
+| `## Historical Sensor Data` (`Full Historical Data JSON`) | Every **actual/realized** period so far today (not forecast) — `battery_soe_start`/`battery_soe_end` and all energy fields, per period. | Exact. Use this for a run's true *starting* SOE (the DP's real `initial_soe` input at that run's decision time) if you're on a bundle exported before #481 and have no per-period snapshot data — cross-reference the run's timestamp to the nearest actual period here. |
+| `## System Logs (Today)` | Every optimization run's per-period box-drawing table — now largely superseded by the snapshot deltas above (added in the same PR that fixed a real gap here: log-compaction previously dropped SOLAR_EXPORT/SOLAR_STORAGE/IDLE rows entirely). Still useful as a secondary check, or for bundles predating #481. | Rounded — see the exact column format below if you do need it. Log compaction can strip the header row. |
+
+**Per-period box-table row format** (`core/bess/dp_battery_algorithm.py:869-872`
+defines it — read the source, don't guess column meaning from the data), only
+needed for bundles predating #481 or as a secondary cross-check:
+```
+║ Hr ║  Buy/Sell ║Cons. ║ Cost  ║║Sol. ║Sol→B ║Gr→B  ║ SoE ║Action ║    Intent     ║  Grid ║ Batt ║ Save ║
+```
+period | buy/sell (SEK, 2dp) | consumption (kWh, 1dp) | base cost (SEK, 2dp) || solar (kWh, 1dp) |
+solar→battery (kWh, 1dp) | grid→battery (kWh, 1dp) | **SoE (kWh, 0dp — rounded to the nearest
+whole kWh, coarser than the DP's own `SOE_STEP_KWH` grid)** | battery action (kWh, 1dp) | intent |
+grid cost, battery cost, savings (SEK, 2dp each).
+
+`scripts/extract_decision_evidence.py` already does single-slot cross-run
+reconciliation against System Logs for you — use it for "did period X change
+between runs" questions when you don't need the full forecast diff. For "what
+changed between run N and run N+1," prefer reading run N+1's
+`predicted_periods_delta` directly over hand-parsing System Logs box tables —
+the delta *is* the diff, already computed.
+
+**Debugging a run-to-run flip in a strategic intent (e.g. "why did period X
+change from LOAD_SUPPORT to IDLE between two runs?"):**
+
+**On a bundle with per-period snapshot data (post-#481): just diff the two
+runs directly, first.** Find both runs' `Prediction Snapshots` entries. On a
+post-#555 bundle, run N+1's `predicted_periods_delta` already contains exactly
+the periods that moved in any field (and `predicted_periods_dropped` those
+that realized) — read the flipped period's entry there and compare
+`buy`, `sell`, `solar`, `load`, `soe_start` against the same period's most
+recent earlier entry (walk back through preceding deltas to the baseline). On a
+#481–#555 bundle, compare the two runs' whole `predicted_periods` arrays
+field-by-field instead. Whatever changed IS the cause — you don't need to guess
+or sweep. If nothing in the forward horizon changed but the starting SOE
+differs, that's the cause instead (compare each run's own first forecast entry,
+or its `optimization_period`'s preceding actual in Historical Sensor Data). If
+literally nothing differs between the two runs' inputs and the decision
+still flipped, THEN it's worth suspecting a genuine algorithm inconsistency
+— proceed to the sensitivity-sweep below to characterize it.
+
+**On an older bundle with no per-period snapshot data, or to characterize *why*
+a real input difference changed the decision** (numerical noise / #450-class
+grid-snap artifact vs. a real, steep-but-correct decision boundary) — test it:
+
+1. Get the flipped period's exact `buy_price`/`sell_price`/`solar_production`/
+   `home_consumption` for itself and every period after it (only the *forward*
+   horizon matters — backward induction doesn't need periods before the one
+   you're investigating, only its own onward trajectory) from the latest run's
+   `input_data`, if these values are confirmed frozen/identical across the
+   runs you're comparing (check the box tables for that).
+2. Run `optimize_battery_schedule()` on that exact sub-horizon while sweeping
+   `initial_soe` in `SOE_STEP_KWH` steps across a plausible range (bracket
+   it using the box tables' rounded `SoE` reading, or the nearest actual SOE
+   from Historical Sensor Data). Find the SOE value(s) where the chosen
+   intent flips.
+3. **The flip point alone doesn't tell you whether it's noise** — any
+   grid-based DP's decision changes only at grid points, tie or not. Check
+   the *margin* at the flip boundary instead: if a branch/PR under test
+   exposes a tie-detection diagnostic (e.g. the `design/450-hybrid-dp-pwl-tie-resolution`
+   branch's `tie_diagnostics`), a near-zero margin there means genuine
+   noise; a large margin (the two choices are clearly, confidently
+   different in value right up to the boundary) means it's a real, sharp —
+   if steep — decision boundary, not an artifact. Verified this way on
+   issue #466: periods 76/89's IDLE↔LOAD_SUPPORT flip had margins of
+   0.4–2.2 SEK at the boundary, far above the tie-noise threshold, on both
+   the production DP and the hybrid branch — genuine sensitivity to
+   accumulated SOE, not #450-class noise, and #467 would not change the
+   outcome. (This investigation predated per-period snapshot data existing, so it
+   had to reconstruct the sweep instead of diffing directly — a bundle with
+   #481 would let step 1 above answer "what changed" immediately.)
+
 1. **Pin the period.** Convert the clock time in the question to a period number and
    slot; state both. Guard the off-by-one (15-min slots).
 2. **Facts before narrative.** Read that period's row in `### Period Decisions`.
@@ -87,8 +166,10 @@ move." Explain where it happened and WHY runs differ (usually near-threshold
    `### Economic Summary`.
 4. **Apply the governing law.** State the counterfactual explicitly ("the
    alternative to this action was ___"). Compute marginal value vs that
-   counterfactual using opportunity cost = `shadow_price` (floored by `sell_price`
-   under solar replenishment). Verdict: correct / incorrect / marginal-and-why.
+   counterfactual using opportunity cost = `shadow_price` (floored by
+   `sell_price / discharge_efficiency` under solar replenishment -- since #683
+   `shadow_price` is per kWh **delivered**, so it is directly comparable to
+   `buy_price` but sits a factor 1/eta above `sell_price`). Verdict: correct / incorrect / marginal-and-why.
    Never use gross value.
 5. **Cite the code path.** Name the exact function/lines that produced the decision
    (e.g. the discharge gate in `_compute_reward`,

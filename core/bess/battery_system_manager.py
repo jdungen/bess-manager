@@ -6,12 +6,14 @@ Complete replacement for battery_system.py that preserves ALL functionality.
 import json
 import logging
 import os
-import statistics
 import traceback
-from datetime import date, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta, tzinfo
 from typing import Any, ClassVar
 
+import requests
+
 from . import time_utils
+from .consumption_overlay import apply_overlay, period_starts_from
 from .daily_view_builder import DailyView, DailyViewBuilder
 from .daily_view_store import DailyViewStore
 from .dp_battery_algorithm import (
@@ -22,24 +24,32 @@ from .dp_battery_algorithm import (
 from .dp_schedule import DPSchedule
 from .entsoe_source import EntsoeSource
 from .exceptions import (
+    ConsumptionOverlayError,
     HAStatisticsUnavailableError,
     HistoricalDataUnavailableError,
+    ManagedLoadsError,
     SystemConfigurationError,
 )
+from .execution_model import PlatformCapabilities, intra_period_discharge_gate
 from .growatt_min_controller import GrowattMinController
 from .growatt_sph_controller import GrowattSphController
 from .ha_api_controller import HomeAssistantAPIController
-from .health_check import describe_failing_checks, run_system_health_checks
+from .ha_recorder_helper import get_power_sensor_data_batch
+from .health_check import (
+    resolve_component_device,
+    run_system_health_checks,
+)
 from .health_recovery_tracker import HealthRecovery, HealthRecoveryTracker
 from .historical_data_store import HistoricalDataStore
 from .huawei_controller import HuaweiController
-from .influxdb_helper import get_power_sensor_data_batch, is_influxdb_configured
 from .inverter_controller import InverterController
+from .managed_loads import subtract_managed_loads
 from .models import (
     DecisionData,
     EconomicData,
     EconomicSummary,
     PeriodData,
+    apply_export_curtailment_to_period_data,
     infer_intent_from_flows,
 )
 from .octopus_energy_source import OctopusEnergySource
@@ -60,6 +70,7 @@ from .settings import (
 from .solax_controller import SolaxController
 from .solax_modbus_growatt_controller import SolaxModbusGrowattController
 from .solis_modbus_controller import SolisModbusController
+from .terminal_value import TerminalValueCurve, calculate_terminal_curve
 from .time_utils import (
     format_period,
     get_period_count,
@@ -70,28 +81,67 @@ from .weather import fetch_temperature_forecast
 logger = logging.getLogger(__name__)
 
 
-def intra_period_discharge_gate(
-    buy_price: float, shadow_price: float, eff_d: float
-) -> int:
-    """Intra-period discharge gate for a SOLAR_EXPORT, SOLAR_STORAGE, or
-    LOAD_SUPPORT period.
+def ha_statistics_quarterly_profile(
+    stats: list[dict], tz: tzinfo
+) -> tuple[list[float], int]:
+    """Hour-of-day trimmed-mean consumption profile, as 96 quarter-hour values.
 
-    All three intents map to load_first; SOLAR_EXPORT/SOLAR_STORAGE plan
-    discharge_rate=0, LOAD_SUPPORT plans a nonzero plan-scaled rate. In every
-    case the battery can additionally cover an actual (sub-period) solar/load
-    deficit beyond whatever was planned. Whether it SHOULD is economic: cover
-    from battery only when the stored energy is worth less than buying from
-    grid now.
+    Returns ``(profile, hours_with_data)``. The caller owns what to do when
+    too few hours carry data, because only it knows which sensor to name in
+    the error -- the transformation itself has no opinion.
 
-    Using 1 kWh of SoE delivers ``eff_d`` kWh to the home, avoiding
-    ``eff_d * buy_price``; ``shadow_price`` is the marginal opportunity value of
-    that kWh of SoE (dV/dSoE), already in per-kWh-of-SoE units with future
-    efficiencies baked in — so ``eff_d`` multiplies only the buy side.
+    Module-level so ``scripts/knee_oracle.py`` can rebuild the exact profile
+    production fed the DP from a debug bundle's captured statistics, rather
+    than from a second implementation of the trimming rule. That distinction
+    is load-bearing for the oracle: scoring the terminal knee (#602/#687)
+    against metered actuals only measures anything if the forecast side is
+    the forecast production actually held.
 
-    Returns 100 (allow discharge) when ``buy_price * eff_d >= shadow_price``,
-    else 0 (hold the reserve, buy the dip from grid).
+    The trimmed mean drops the min and max at >=5 samples (max only at >=3)
+    for outlier robustness -- an EV charge or a one-off boiler cycle should
+    not become the household's baseline. Note this makes it a *central*
+    estimate, which is the right target for predicting a day's cost and the
+    wrong one for sizing an overnight reserve, whose loss is asymmetric
+    (see #381). Hours with no samples stay 0.0 and are not counted in
+    ``hours_with_data``.
     """
-    return 100 if buy_price * eff_d >= shadow_price else 0
+    hourly_buckets: dict[int, list[float]] = {h: [] for h in range(24)}
+    for entry in stats:
+        change = entry.get("change")
+        if change is None:
+            continue
+        start_val = entry.get("start")
+        if start_val is None:
+            continue
+        try:
+            if isinstance(start_val, (int, float)):
+                # HA returns millisecond epoch timestamps
+                ts = start_val / 1000 if start_val > 1e12 else start_val
+                dt = datetime.fromtimestamp(ts, tz=UTC).astimezone(tz)
+            else:
+                dt = datetime.fromisoformat(str(start_val)).astimezone(tz)
+            hourly_buckets[dt.hour].append(float(change))
+        except (ValueError, TypeError, OverflowError):
+            continue
+
+    hourly_avg = [0.0] * 24
+    hours_with_data = 0
+    for hour in range(24):
+        values = hourly_buckets[hour]
+        if values:
+            if len(values) >= 5:
+                trimmed = sorted(values)[1:-1]  # drop min and max
+            elif len(values) >= 3:
+                trimmed = sorted(values)[:-1]  # drop max only
+            else:
+                trimmed = values
+            hourly_avg[hour] = sum(trimmed) / len(trimmed)
+            hours_with_data += 1
+
+    quarterly_profile: list[float] = []
+    for hour_kwh in hourly_avg:
+        quarterly_profile.extend([hour_kwh / 4.0] * 4)
+    return quarterly_profile, hours_with_data
 
 
 class BatterySystemManager:
@@ -187,9 +237,20 @@ class BatterySystemManager:
         self._desired_strategic_intent: str = ""  # alongside the rate above
         self._last_applied_discharge_rate: int = 0  # Last rate written to inverter
 
-        # Prediction caches (populated by _fetch_predictions)
+        # Export-limit curtailment state (#269) — tracks whether the hardware
+        # is currently curtailed so release can fire even on a period whose
+        # own plan doesn't call for export (see _apply_period_schedule).
+        self._export_limit_curtailed: bool = False
+
+        # Consumption forecast cache. Only used for the 'load_power_7d_avg'
+        # and 'ha_statistics' strategies, whose value is a window of full
+        # calendar days ending at today's midnight and so provably can't
+        # change intraday — the cache is invalidated on date rollover, not
+        # a clock-based TTL (see issue #395). 'sensor'/'fixed' read a cheap,
+        # continuously-updating source and always fetch fresh, same as
+        # solar's controller.get_solar_forecast() every quarterly run.
         self._consumption_predictions: list[float] | None = None
-        self._solar_predictions: list[float] | None = None
+        self._consumption_predictions_date: date | None = None
 
         # Critical sensor failure tracking for graceful degradation
         self._critical_sensor_failures = []
@@ -242,41 +303,21 @@ class BatterySystemManager:
         "huawei_solar_luna2000",
     }
 
-    _INVERTER_TYPE_TO_PLATFORM: ClassVar[dict[str, str]] = {
-        "growatt_server_min": "growatt_server_min",
-        "solax_modbus_growatt_min": "solax_modbus_growatt_min",
-        "solax_modbus_growatt_sph": "solax_modbus_growatt_sph",
-        "growatt_server_sph": "growatt_server_sph",
-        "solax_modbus_native": "solax_modbus_native",
-        "solis_modbus": "solis_modbus",
-        "huawei_solar_luna2000": "huawei_solar_luna2000",
-        # Legacy values stored in growatt.inverter_type
-        "MIN": "growatt_server_min",
-        "SPH": "growatt_server_sph",
-    }
-
     @staticmethod
     def _resolve_initial_platform(options: dict) -> str | None:
         """Determine inverter platform from startup config.
 
-        Checks ``inverter.platform`` first, then falls back to the legacy
-        ``growatt.inverter_type`` key.  Returns None on a fresh install.
+        ``inverter.platform`` is the source of truth; installs predating it are
+        rewritten by ``SettingsStore._migrate_schema()`` before this runs.
+        Returns None on a fresh install.
         """
         platform = options.get("inverter", {}).get("platform")
         if not platform:
-            inverter_type = options.get("growatt", {}).get("inverter_type", "")
-            if not inverter_type:
-                logger.info(
-                    "No inverter platform configured — "
-                    "system will start in unconfigured mode"
-                )
-                return None
-            assert inverter_type in BatterySystemManager._INVERTER_TYPE_TO_PLATFORM, (
-                f"Unknown inverter_type '{inverter_type}', "
-                f"expected one of "
-                f"{list(BatterySystemManager._INVERTER_TYPE_TO_PLATFORM)}"
+            logger.info(
+                "No inverter platform configured — "
+                "system will start in unconfigured mode"
             )
-            platform = BatterySystemManager._INVERTER_TYPE_TO_PLATFORM[inverter_type]
+            return None
 
         assert platform in BatterySystemManager.VALID_PLATFORMS, (
             f"Unknown inverter platform '{platform}', "
@@ -285,6 +326,14 @@ class BatterySystemManager:
         return platform
 
     VALID_CONTROL_MODES: ClassVar[set[str]] = {"tou", "vpp"}
+
+    # Strategies whose forecast is a window of full calendar days ending at
+    # today's midnight — the value can't change intraday, so it's cached
+    # until the date rolls over instead of refetched every quarterly cycle.
+    _DATE_CACHED_CONSUMPTION_STRATEGIES: ClassVar[set[str]] = {
+        "load_power_7d_avg",
+        "ha_statistics",
+    }
 
     @staticmethod
     def _resolve_control_mode(options: dict, platform: str | None) -> str:
@@ -311,6 +360,41 @@ class BatterySystemManager:
         if not self._inverter_controller:
             return False
         return self._inverter_controller.supports_charge_rate_control
+
+    @property
+    def platform_capabilities(self) -> PlatformCapabilities:
+        """What the active platform can express (Phase 4a, D2).
+
+        The single place these facts are read off the controller, so the
+        planner and the hardware-write path cannot answer the same question
+        two different ways -- the drift shape #282/#497/#511/#537 are all
+        instances of. Without a controller the defaults describe the
+        TOU-register platform the DP has always assumed, which is what the
+        pre-4a `discharge_resolution_kw=None` meant.
+        """
+        if self._inverter_controller is None:
+            return PlatformCapabilities()
+        return PlatformCapabilities.from_controller(
+            self._inverter_controller, self.battery_settings
+        )
+
+    @property
+    def export_curtailment_active(self) -> bool:
+        """Whether export curtailment is actually in effect for planning.
+
+        Capability-aware, not just the raw user setting (#459 review):
+        planning for curtailment on a platform that can't actually do it
+        makes outcomes worse than leaving the feature off (see
+        optimize_battery_schedule's export_curtailment_active docstring).
+        Entity misconfiguration on a supported platform is a separate,
+        self-correcting case surfaced by the runtime failure banner in
+        _apply_period_schedule, not checked here.
+        """
+        return (
+            self.battery_settings.export_curtailment_enabled
+            and self._inverter_controller is not None
+            and self._inverter_controller.supports_export_limit_control
+        )
 
     def _create_inverter_controller(self) -> InverterController | None:
         """Create an inverter controller for ``self.inverter_platform``.
@@ -365,6 +449,8 @@ class BatterySystemManager:
             platform,
         )
 
+        if self._inverter_controller is not None:
+            self._inverter_controller.leave_control_mode(self._controller)
         self.inverter_platform = platform
         self.control_mode = self._resolve_control_mode({}, platform)
         self._inverter_controller = self._create_inverter_controller()
@@ -417,6 +503,7 @@ class BatterySystemManager:
             self.control_mode,
             control_mode,
         )
+        self._inverter_controller.leave_control_mode(self._controller)
         self.control_mode = control_mode
         self._inverter_controller = self._create_inverter_controller()
         logger.info(
@@ -513,6 +600,13 @@ class BatterySystemManager:
 
         try:
             if self._controller:
+                # Warm the price cache once, synchronously, before the first
+                # optimization runs — the quarterly cycle reads cache-only and
+                # never fetches on the scheduler thread (#709). The recurring
+                # refresh is a dedicated scheduler job (app.py).
+                _status("Fetching electricity prices...")
+                self._price_manager.refresh_cache()
+
                 # Initialize power monitor only when feature is enabled and
                 # the platform has per-period charge rate control
                 if (
@@ -584,7 +678,7 @@ class BatterySystemManager:
                 )
 
     def reinitialize_historical_data(self) -> None:
-        """Re-run the historical InfluxDB backfill.
+        """Re-run the historical recorder backfill.
 
         Called after the setup wizard configures sensors so that today's
         history is available for the first optimization run.
@@ -671,6 +765,15 @@ class BatterySystemManager:
                 logger.error("Failed to optimize battery schedule")
                 return False
 
+            # Capture the full-horizon economic summary before
+            # _create_updated_schedule rescopes result.economic_summary to
+            # today-only in place (see _create_updated_schedule). The DP
+            # results table logs the full extended horizon, so the Summary
+            # block must come from the full-horizon summary, not the
+            # today-scoped one — otherwise table and Summary silently
+            # disagree in the same log block.
+            full_horizon_summary = optimization_result.economic_summary
+
             # Create new schedule
             temp_schedule = self._create_updated_schedule(
                 optimization_period,
@@ -712,6 +815,29 @@ class BatterySystemManager:
                 # every per-period hardware write, even on a not-apply cycle
                 # where the DP re-optimized battery-action magnitudes without
                 # changing which TOU/VPP mode is active.
+                # Nothing in the plan changed, but the inverter may still have
+                # lost a segment we programmed or restored one we did not
+                # (issue #551). Since #554 the write path is skipped on cycles
+                # like this one, so without re-asserting here nothing would
+                # look at the inverter again until the plan itself changed.
+                # A no-op on platforms that rewrite everything anyway, and a
+                # no-op here too when the inverter already agrees.
+                if self._controller is not None and not prepare_next_day:
+                    try:
+                        self._inverter_controller.reconcile_hardware(
+                            self._controller, current_period
+                        )
+                    except Exception as e:
+                        # Same handling as a failed apply: record it so the
+                        # next cycle retries, and let the optimization stand —
+                        # it needs no inverter at all.
+                        self._hardware_write_pending = True
+                        logger.error(
+                            "Could not re-assert the schedule on the inverter: "
+                            "%s — will retry next cycle",
+                            e,
+                        )
+
                 self._current_schedule = temp_schedule
                 self._inverter_controller.strategic_intents = (
                     temp_schedule.strategic_intents
@@ -734,7 +860,26 @@ class BatterySystemManager:
                     format_period(current_period),
                 )
 
-            self.log_battery_schedule(current_period)
+            # Log the applied schedule tables and the DP results table only
+            # when the schedule actually changed. On quiet keep cycles both
+            # are byte-identical to what was already logged, and re-dumping
+            # them every 15 minutes is what grew the daily log to 2.3MB.
+            if should_apply:
+                # Reaching here means prices were non-empty (guarded above),
+                # and prices are derived from price_entries — so it is safe.
+                assert price_entries is not None
+                remaining_entries = price_entries[optimization_period:]
+                buy_prices, sell_prices = self._extract_buy_sell_prices(
+                    remaining_entries
+                )
+                print_optimization_results(
+                    optimization_result,
+                    buy_prices,
+                    sell_prices,
+                    economic_summary=full_horizon_summary,
+                )
+                self.log_battery_schedule(current_period)
+
             return True
 
         except Exception as e:
@@ -770,7 +915,9 @@ class BatterySystemManager:
         """
         try:
             # Build daily view (merges actuals + predictions)
-            daily_view = self.daily_view_builder.build_daily_view(optimization_period)
+            daily_view = self.daily_view_builder.build_daily_view(
+                optimization_period, self.export_curtailment_active
+            )
 
             # Get current Growatt schedule
             growatt_schedule = self._inverter_controller.tou_intervals.copy()
@@ -819,7 +966,7 @@ class BatterySystemManager:
     def _load_historical_seed(self, current_period: int) -> bool:
         """Seed the historical store from BESS_HISTORICAL_SEED_FILE if set.
 
-        Returns True if seeding succeeded and InfluxDB backfill should be skipped.
+        Returns True if seeding succeeded and the recorder backfill should be skipped.
         """
         seed_file = os.environ.get("BESS_HISTORICAL_SEED_FILE", "")
         if not seed_file:
@@ -847,6 +994,36 @@ class BatterySystemManager:
         logger.info("Historical seed loaded: %d periods from '%s'", loaded, seed_file)
         return loaded > 0
 
+    def _load_today_from_disk(self, current_period: int) -> None:
+        """Seed historical_store from today's persisted DailyView, if any.
+
+        Only periods marked data_source == "actual" are trusted as real
+        recovered data. Periods the file marked "predicted" or "missing"
+        (e.g. a period a scheduler tick never got around to recording, see
+        issue #403) are deliberately left unseeded so the recorder backfill
+        that runs after this can still attempt them.
+        """
+        view = self.daily_view_store.load_day(time_utils.today())
+        if view is None:
+            return
+
+        seeded = 0
+        for period_data in view.periods:
+            if period_data.data_source != "actual":
+                continue
+            if not 0 <= period_data.period < current_period:
+                continue
+            try:
+                self.historical_store.record_period(period_data.period, period_data)
+                seeded += 1
+            except ValueError as e:
+                logger.warning(
+                    "Could not seed period %d from disk: %s", period_data.period, e
+                )
+
+        if seeded:
+            logger.info("Seeded %d period(s) from today's persisted file", seeded)
+
     def _fetch_and_initialize_historical_data(self, status_callback=None) -> None:
         """Fetch and initialize historical data using quarterly resolution."""
         try:
@@ -861,11 +1038,8 @@ class BatterySystemManager:
                 self.sensor_collector.warm_readings_cache()
                 return
 
-            if not is_influxdb_configured():
-                logger.info(
-                    "InfluxDB is not configured — skipping historical data backfill"
-                )
-                return
+            if current_period > 0:
+                self._load_today_from_disk(current_period)
 
             if current_period > 0:
                 # Get prices once for all periods (fetch outside loop to avoid repeated API calls)
@@ -884,6 +1058,8 @@ class BatterySystemManager:
                         status_callback(
                             f"Fetching historical data ({hour}/{total_hours}h)..."
                         )
+                    if self.historical_store.get_period(period) is not None:
+                        continue
                     try:
                         # Collect cumulative sensor readings at period boundary (calculate deltas for energy flows)
                         period_energy_data = self.sensor_collector.collect_energy_data(
@@ -941,6 +1117,16 @@ class BatterySystemManager:
                             f"SOC={period_energy_data.battery_soe_start:.1f}%→{period_energy_data.battery_soe_end:.1f}%"
                         )
 
+                    except HistoricalDataUnavailableError as e:
+                        # Expected on a cold start before the recorder has
+                        # history for this period (fresh install part-way
+                        # through the day, or recorder retention shorter than
+                        # the gap). The period stays predicted and fills in
+                        # once data exists — not a warning-level event.
+                        logger.debug(
+                            f"No recorder history yet for period {period} "
+                            f"({format_period(period)}): {e}"
+                        )
                     except Exception as e:
                         logger.warning(
                             f"Failed to collect/store data for period {period} ({format_period(period)}): {e}"
@@ -972,18 +1158,22 @@ class BatterySystemManager:
             logger.error(f"Failed to initialize historical data: {e}")
 
     def _fetch_predictions(self) -> None:
-        """Fetch consumption and solar predictions and store them."""
+        """Fetch the consumption forecast and store it.
+
+        Solar has no cache to warm here — _gather_optimization_data fetches
+        it live via controller.get_solar_forecast() on every quarterly run.
+        """
         try:
             if self._controller is None:
                 logger.warning("Cannot fetch predictions: controller is not available")
                 return
 
             consumption_predictions = self._get_consumption_forecast()
-            solar_predictions = self._controller.get_solar_forecast()
 
             # Store the predictions (this was missing!)
             if consumption_predictions:
                 self._consumption_predictions = consumption_predictions
+                self._consumption_predictions_date = time_utils.today()
                 logger.debug(
                     "Fetched consumption predictions: %s",
                     [round(value, 1) for value in consumption_predictions],
@@ -992,15 +1182,6 @@ class BatterySystemManager:
                 logger.warning(
                     "Invalid consumption predictions format, keeping defaults"
                 )
-
-            if solar_predictions:
-                self._solar_predictions = solar_predictions
-                logger.info(
-                    "Fetched solar predictions: %s",
-                    [round(value, 1) for value in solar_predictions],
-                )
-            else:
-                logger.warning("Invalid solar predictions format, keeping defaults")
 
         except Exception as e:
             logger.warning(f"Failed to fetch predictions: {e}")
@@ -1050,7 +1231,7 @@ class BatterySystemManager:
             hours without complete actual data).
         """
         active_strategy = self.home_settings.consumption_strategy
-        strategy_names = ["sensor", "fixed", "influxdb_7d_avg", "ha_statistics"]
+        strategy_names = ["sensor", "fixed", "load_power_7d_avg", "ha_statistics"]
         results = []
 
         for name in strategy_names:
@@ -1068,10 +1249,8 @@ class BatterySystemManager:
                 elif name == "fixed":
                     quarterly = self.home_settings.default_hourly / 4.0
                     forecast = [quarterly] * 96
-                elif name == "influxdb_7d_avg":
-                    if not is_influxdb_configured():
-                        raise ValueError("InfluxDB not configured")
-                    forecast = self._get_influxdb_7d_avg_forecast()
+                elif name == "load_power_7d_avg":
+                    forecast = self._get_load_power_7d_avg_forecast()
                 elif name == "ha_statistics":
                     forecast = self._get_ha_statistics_forecast()
                 else:
@@ -1115,6 +1294,94 @@ class BatterySystemManager:
             "actual_hours_available": actual_hours,
         }
 
+    def _apply_consumption_overlay(
+        self,
+        consumption_predictions: list[float],
+        period_count: int,
+        prepare_next_day: bool,
+    ) -> list[float]:
+        """Compose the user's declared consumption changes onto the forecast.
+
+        Args:
+            consumption_predictions: The forecast as the configured strategy
+                produced it, already extended to cover the horizon.
+            period_count: Periods in the horizon.
+            prepare_next_day: Whether this horizon starts at tomorrow 00:00
+                rather than today 00:00 — which day index 0 refers to.
+
+        Returns:
+            The composed forecast, or the input unchanged when no overlay
+            entity is configured.
+
+        """
+        try:
+            blocks = self.controller.get_consumption_overlay_blocks()
+        except ConsumptionOverlayError as e:
+            # The error still propagates — no silent fallback. Recording it
+            # first is what puts it on the dashboard: the caller's blanket
+            # handler logs and returns False, which on its own leaves the
+            # schedule frozen at the last good one with no user-visible signal.
+            logger.error("Planned consumption changes are unusable: %s", e)
+            self._runtime_failure_tracker.record_failure_once(
+                category="CONSUMPTION_OVERLAY",
+                operation=(
+                    "Planned consumption changes entity could not be read — "
+                    "optimization is blocked until the template is fixed"
+                ),
+                error=e,
+            )
+            raise
+        self._runtime_failure_tracker.dismiss_by_category("CONSUMPTION_OVERLAY")
+
+        if not blocks:
+            # Nothing declared today. Dismiss any stale clamp warning first —
+            # deleting the offending block is the obvious way a user expects
+            # to clear it, and returning before the dismiss below made that
+            # impossible.
+            self._runtime_failure_tracker.dismiss_by_category(
+                "CONSUMPTION_OVERLAY_CLAMPED"
+            )
+            return consumption_predictions
+
+        first_period = (
+            time_utils.get_period_count(time_utils.today()) if prepare_next_day else 0
+        )
+        period_starts = period_starts_from(
+            time_utils.period_index_to_timestamp(first_period), period_count
+        )
+
+        result = apply_overlay(
+            consumption_predictions[:period_count], period_starts, blocks
+        )
+
+        logger.info(
+            "Applied planned consumption changes: %d entr(y/ies), %.1f kWh net over the horizon",
+            len(blocks),
+            sum(result.values) - sum(consumption_predictions[:period_count]),
+        )
+
+        if result.clamped_periods:
+            logger.warning(
+                "Planned consumption changes subtracted more than the forecast held in "
+                "%d period(s); those were clamped to zero",
+                result.clamped_periods,
+            )
+            self._runtime_failure_tracker.record_failure_once(
+                category="CONSUMPTION_OVERLAY_CLAMPED",
+                operation=(
+                    f"Planned consumption changes clamped {result.clamped_periods} "
+                    f"period(s) to zero — a subtract block removes more "
+                    f"load than the forecast contains"
+                ),
+                error=ValueError("overlay subtraction exceeded base forecast"),
+            )
+        else:
+            self._runtime_failure_tracker.dismiss_by_category(
+                "CONSUMPTION_OVERLAY_CLAMPED"
+            )
+
+        return result.values
+
     def _get_consumption_forecast(self) -> list[float]:
         """Get consumption forecast based on the configured strategy.
 
@@ -1133,8 +1400,8 @@ class BatterySystemManager:
             quarterly = self.home_settings.default_hourly / 4.0
             return [quarterly] * 96
 
-        if strategy == "influxdb_7d_avg":
-            return self._get_influxdb_7d_avg_forecast()
+        if strategy == "load_power_7d_avg":
+            return self._get_load_power_7d_avg_forecast()
 
         if strategy == "ha_statistics":
             # Data-insufficiency or missing-sensor errors are handled the same
@@ -1147,7 +1414,7 @@ class BatterySystemManager:
                     "HA_STATISTICS_FALLBACK"
                 )
                 return result
-            except HAStatisticsUnavailableError as e:
+            except (HAStatisticsUnavailableError, ManagedLoadsError) as e:
                 quarterly = self.home_settings.default_hourly / 4.0
                 logger.warning(
                     "HA statistics unavailable (%s), falling back to fixed "
@@ -1171,23 +1438,22 @@ class BatterySystemManager:
 
         raise ValueError(f"Unknown consumption_strategy: '{strategy}'")
 
-    def _get_influxdb_7d_avg_forecast(self) -> list[float]:
-        """Get consumption forecast from InfluxDB 7-day average profile.
+    def _get_load_power_7d_avg_forecast(self) -> list[float]:
+        """Consumption forecast: 7-day average of the local_load_power sensor.
 
-        Queries InfluxDB for the past 7 days of the local_load_power sensor
-        and returns the 96-value weekly average profile (kWh per 15-min period).
+        Reads the past 7 days of the local_load_power sensor from Home
+        Assistant's recorder and returns the 96-value weekly average profile
+        (kWh per 15-min period).
         """
-        target_sensor = (
-            self._controller.sensors.get("local_load_power", "")
-            if self._controller
-            else ""
-        )
+        if self._controller is None:
+            raise ValueError("load_power_7d_avg strategy requires a controller")
+        target_sensor = self._controller.sensors.get("local_load_power", "")
         if not target_sensor:
             raise ValueError(
-                "influxdb_7d_avg strategy requires 'local_load_power' sensor configured"
+                "load_power_7d_avg strategy requires 'local_load_power' sensor configured"
             )
 
-        # Strip 'sensor.' prefix if present — get_power_sensor_data_batch adds it
+        # Strip 'sensor.' prefix if present — the recorder helper re-adds it
         if target_sensor.startswith("sensor."):
             target_sensor = target_sensor[len("sensor.") :]
 
@@ -1196,7 +1462,9 @@ class BatterySystemManager:
 
         for days_back in range(1, 8):
             target_date = today - timedelta(days=days_back)
-            result = get_power_sensor_data_batch([target_sensor], target_date)
+            result = get_power_sensor_data_batch(
+                self._controller, [target_sensor], target_date
+            )
 
             if result["status"] != "success":
                 logger.warning(
@@ -1221,7 +1489,7 @@ class BatterySystemManager:
 
         if not day_profiles:
             raise ValueError(
-                "influxdb_7d_avg strategy: no valid historical data found in InfluxDB "
+                "load_power_7d_avg strategy: no valid recorder history found "
                 f"for the past 7 days of sensor '{target_sensor}'"
             )
 
@@ -1232,12 +1500,59 @@ class BatterySystemManager:
 
         total_kwh = sum(avg_profile)
         logger.info(
-            "InfluxDB 7-day average profile: %.1f kWh/day from %d days of data",
+            "Recorder 7-day average load profile: %.1f kWh/day from %d days of data",
             total_kwh,
             len(day_profiles),
         )
 
         return avg_profile
+
+    def _fetch_recorder_change_stats(
+        self, entity_id: str, start_dt: datetime, end_dt: datetime
+    ) -> tuple[str, list[dict]]:
+        """Fetch one entity's raw hourly 'change' statistics for [start_dt, end_dt).
+
+        Shared by the main load-consumption sensor and each managed-load
+        sensor in _fetch_ha_statistics_raw — both are HA Recorder long-term
+        statistics reads with the same discovery fallback.
+
+        Returns:
+            (statistic_id, stats) — stats is the raw HA Recorder list of
+            {"start": ..., "change": ...} entries, or [] if none exist.
+        """
+        if not entity_id.startswith("sensor."):
+            entity_id = f"sensor.{entity_id}"
+
+        # Try direct entity_id first, then discover the correct statistic_id
+        # (external integrations may register statistics under a different ID)
+        statistic_id = entity_id
+        result = self._controller.get_statistics_during_period(
+            statistic_ids=[statistic_id],
+            start_time=start_dt.isoformat(),
+            end_time=end_dt.isoformat(),
+            period="hour",
+            types=["change"],
+        )
+        stats = result.get(statistic_id, [])
+        if not stats:
+            discovered_id = self._controller.find_statistic_id(entity_id)
+            if discovered_id and discovered_id != statistic_id:
+                logger.info(
+                    "Statistic ID for %s is %s (differs from entity_id)",
+                    entity_id,
+                    discovered_id,
+                )
+                statistic_id = discovered_id
+                result = self._controller.get_statistics_during_period(
+                    statistic_ids=[statistic_id],
+                    start_time=start_dt.isoformat(),
+                    end_time=end_dt.isoformat(),
+                    period="hour",
+                    types=["change"],
+                )
+                stats = result.get(statistic_id, [])
+
+        return statistic_id, stats
 
     def _fetch_ha_statistics_raw(self) -> tuple[str, list[dict]]:
         """Resolve the load-consumption statistic_id and fetch its raw 7-day stats.
@@ -1246,12 +1561,20 @@ class BatterySystemManager:
         time-of-day profile) and get_ha_statistics_for_debug_export (which
         exports it verbatim for exact-fidelity mock replay).
 
+        If managed_load_sensors is configured, each one's own 7-day stats are
+        fetched the same way and subtracted before returning — the residual
+        is what both callers see, so the debug export stays consistent with
+        what the forecast actually uses (issue #706).
+
         Returns:
             (statistic_id, stats) — stats is the raw HA Recorder
-            list of {"start": ..., "change": ...} entries.
+            list of {"start": ..., "change": ...} entries, residual of any
+            configured managed loads.
 
         Raises:
             HAStatisticsUnavailableError: sensor not configured, or no
+                statistics data available for it in the past 7 days.
+            ManagedLoadsError: a configured managed-load sensor has no
                 statistics data available for it in the past 7 days.
         """
         from datetime import time
@@ -1278,42 +1601,39 @@ class BatterySystemManager:
         start_dt = datetime.combine(start_date, time(0, 0), tzinfo=tz)
         end_dt = datetime.combine(today_date, time(0, 0), tzinfo=tz)
 
-        # Try direct entity_id first, then discover the correct statistic_id
-        # (external integrations may register statistics under a different ID)
-        statistic_id = target_sensor
-        result = self._controller.get_statistics_during_period(
-            statistic_ids=[statistic_id],
-            start_time=start_dt.isoformat(),
-            end_time=end_dt.isoformat(),
-            period="hour",
-            types=["change"],
+        statistic_id, stats = self._fetch_recorder_change_stats(
+            target_sensor, start_dt, end_dt
         )
-
-        stats = result.get(statistic_id, [])
-        if not stats:
-            # Entity_id didn't match — discover the correct statistic_id
-            discovered_id = self._controller.find_statistic_id(target_sensor)
-            if discovered_id and discovered_id != statistic_id:
-                logger.info(
-                    "Statistic ID for %s is %s (differs from entity_id)",
-                    target_sensor,
-                    discovered_id,
-                )
-                statistic_id = discovered_id
-                result = self._controller.get_statistics_during_period(
-                    statistic_ids=[statistic_id],
-                    start_time=start_dt.isoformat(),
-                    end_time=end_dt.isoformat(),
-                    period="hour",
-                    types=["change"],
-                )
-                stats = result.get(statistic_id, [])
-
         if not stats:
             raise HAStatisticsUnavailableError(
                 f"No statistics data returned for {target_sensor} "
                 f"(statistic_id: {statistic_id}) in the past 7 days"
             )
+
+        managed_load_sensors = self.home_settings.managed_load_sensors
+        if managed_load_sensors:
+            managed_stats = []
+            for sensor_entity_id in managed_load_sensors:
+                _, m_stats = self._fetch_recorder_change_stats(
+                    sensor_entity_id, start_dt, end_dt
+                )
+                if not m_stats:
+                    raise ManagedLoadsError(
+                        f"No statistics data returned for managed-load sensor "
+                        f"'{sensor_entity_id}' in the past 7 days"
+                    )
+                managed_stats.append(m_stats)
+
+            stats, clamped_hours = subtract_managed_loads(stats, managed_stats)
+            if clamped_hours:
+                logger.warning(
+                    "Managed-load subtraction clamped %d/%d hours to 0 for %s "
+                    "(a managed load's own historical draw exceeded the total "
+                    "load sensor's for those hours)",
+                    clamped_hours,
+                    len(stats),
+                    target_sensor,
+                )
 
         return statistic_id, stats
 
@@ -1331,7 +1651,7 @@ class BatterySystemManager:
             return None
         try:
             statistic_id, stats = self._fetch_ha_statistics_raw()
-        except HAStatisticsUnavailableError:
+        except (HAStatisticsUnavailableError, ManagedLoadsError):
             return None
         return {"statistic_id": statistic_id, "stats": stats}
 
@@ -1343,60 +1663,18 @@ class BatterySystemManager:
         the flat "sensor" strategy, this captures intra-day variation
         (morning/evening peaks, overnight baseline).
         """
-        from datetime import timezone
 
         target_sensor, stats = self._fetch_ha_statistics_raw()
-        tz = time_utils.TIMEZONE
 
-        # Group hourly change values by hour-of-day (0-23)
-        hourly_buckets: dict[int, list[float]] = {h: [] for h in range(24)}
-        for entry in stats:
-            change = entry.get("change")
-            if change is None:
-                continue
-            start_val = entry.get("start")
-            if start_val is None:
-                continue
-            try:
-                if isinstance(start_val, (int, float)):
-                    # HA returns millisecond epoch timestamps
-                    ts = start_val / 1000 if start_val > 1e12 else start_val
-                    dt = datetime.fromtimestamp(ts, tz=timezone.utc).astimezone(tz)
-                else:
-                    dt = datetime.fromisoformat(str(start_val)).astimezone(tz)
-                hourly_buckets[dt.hour].append(float(change))
-            except (ValueError, TypeError, OverflowError):
-                continue
-
-        # Compute per-hour-of-day averages using trimmed mean for outlier
-        # robustness (e.g. EV charging spikes).  Drop the min and max when
-        # there are enough samples; with fewer samples, drop only the max
-        # (spikes are the main concern).
-        hourly_avg = [0.0] * 24
-        hours_with_data = 0
-        for hour in range(24):
-            values = hourly_buckets[hour]
-            if values:
-                if len(values) >= 5:
-                    trimmed = sorted(values)[1:-1]  # drop min and max
-                elif len(values) >= 3:
-                    trimmed = sorted(values)[:-1]  # drop max only
-                else:
-                    trimmed = values
-                hourly_avg[hour] = sum(trimmed) / len(trimmed)
-                hours_with_data += 1
+        quarterly_profile, hours_with_data = ha_statistics_quarterly_profile(
+            stats, time_utils.TIMEZONE
+        )
 
         if hours_with_data < 12:
             raise HAStatisticsUnavailableError(
                 f"Insufficient statistics data: only {hours_with_data}/24 hours "
                 f"have data for {target_sensor}"
             )
-
-        # Expand 24 hourly values to 96 quarter-hourly values
-        quarterly_profile = []
-        for hour_kwh in hourly_avg:
-            quarter_kwh = hour_kwh / 4.0
-            quarterly_profile.extend([quarter_kwh] * 4)
 
         total_kwh = sum(quarterly_profile)
         logger.info(
@@ -1436,17 +1714,10 @@ class BatterySystemManager:
                 logger.warning(f"Failed to get initial SOC: {e}")
 
         if prepare_next_day:
-            logger.info(
-                "Preparing for next day - saving daily view and refreshing predictions"
-            )
-            if is_first_run:
-                # No schedule has ever been created yet (fresh start/restart), so
-                # there is no completed day's view to persist.
-                logger.info(
-                    "Skipping daily view save: no schedule exists yet for today"
-                )
-            else:
-                self.daily_view_store.save_day(self.get_current_daily_view())
+            # Today's file is already current — _persist_today_view() (called
+            # from _update_energy_data on every tick, including this one) has
+            # been keeping it up to date all day. Nothing to save here.
+            logger.info("Preparing for next day - refreshing predictions")
             self.prediction_snapshot_store.clear()
             self._fetch_predictions()
 
@@ -1462,15 +1733,18 @@ class BatterySystemManager:
         tomorrow's data for improved end-of-day optimization. The extended
         horizon is capped at 192 periods (2 days).
         """
+        # Cache-only reads: the quarterly cycle must never fetch prices on the
+        # scheduler thread (#709). The cache is kept warm by the dedicated
+        # refresh job (app.py) and the startup warm-up in start().
         try:
             if prepare_next_day:
-                price_entries = self._price_manager.get_tomorrow_prices()
-                logger.info("Fetched tomorrow's price data")
+                price_entries = self._price_manager.get_cached_tomorrow_prices()
+                logger.info("Using cached tomorrow price data")
             else:
-                price_entries = self._price_manager.get_today_prices()
+                price_entries = self._price_manager.get_cached_today_prices()
 
                 # Extend with tomorrow's prices when available
-                tomorrow_entries = self._price_manager.get_tomorrow_prices()
+                tomorrow_entries = self._price_manager.get_cached_tomorrow_prices()
                 if tomorrow_entries:
                     price_entries = price_entries + tomorrow_entries
                     logger.info(
@@ -1529,8 +1803,8 @@ class BatterySystemManager:
             )
 
             # Use sensor collector to get complete energy data with detailed flows.
-            # Uses live sensors for current data; reconstructs from InfluxDB during
-            # startup/restart backfill. InfluxDB historical reconstruction is an
+            # Uses live sensors for current data; reconstructs from the HA
+            # recorder during startup/restart backfill. Recorder reconstruction is an
             # optional enhancement (it only backfills the actuals/savings view) —
             # if it is unavailable we surface it and skip this period's actuals,
             # because the optimization itself runs on live SOC + the configured
@@ -1642,6 +1916,8 @@ class BatterySystemManager:
         else:
             logger.info("Historical store: no periods stored yet")
 
+        self._persist_today_view()
+
     def _get_planned_intent_for_period(self, period: int) -> str | None:
         """Get the DP-planned strategic intent for a period.
 
@@ -1719,14 +1995,28 @@ class BatterySystemManager:
 
         current_soe = current_soc / 100.0 * self.battery_settings.total_capacity
 
-        # --- Fetch predictions (shared, cache-first) ---
-        # Use cached predictions when available to avoid re-fetching
-        # expensive data sources (e.g. InfluxDB 7-day avg) every cycle
-        consumption_predictions = (
-            self._consumption_predictions
-            if self._consumption_predictions
-            else self._get_consumption_forecast()
-        )
+        # --- Fetch predictions (issue #395) ---
+        # 'sensor'/'fixed' read a cheap, continuously-updating source, so
+        # they refetch every quarterly cycle (same as solar, below).
+        # 'load_power_7d_avg'/'ha_statistics' average a window of full
+        # calendar days ending at today's midnight — that value can't
+        # change intraday, so it's only refetched once the date rolls over,
+        # instead of only at startup/23:55.
+        if (
+            self.home_settings.consumption_strategy
+            in self._DATE_CACHED_CONSUMPTION_STRATEGIES
+        ):
+            if (
+                self._consumption_predictions is not None
+                and self._consumption_predictions_date == time_utils.today()
+            ):
+                consumption_predictions = self._consumption_predictions
+            else:
+                consumption_predictions = self._get_consumption_forecast()
+                self._consumption_predictions = consumption_predictions
+                self._consumption_predictions_date = time_utils.today()
+        else:
+            consumption_predictions = self._get_consumption_forecast()
 
         if prepare_next_day:
             # The next-day schedule must be built from tomorrow's solar forecast, not today's.
@@ -1762,6 +2052,16 @@ class BatterySystemManager:
                     len(tomorrow_solar),
                 )
                 solar_predictions = solar_predictions + tomorrow_solar
+
+        # --- Apply the user's planned consumption changes (issue #428) ---
+        # Deliberately here, not inside _get_consumption_forecast: after the
+        # daily prediction cache, so editing the overlay takes effect on the
+        # next run rather than tomorrow; and after the extension above, so a
+        # block declared for tomorrow lands on tomorrow instead of today's
+        # blocks being duplicated onto it.
+        consumption_predictions = self._apply_consumption_overlay(
+            consumption_predictions, period_count, prepare_next_day
+        )
 
         # --- Build data arrays ---
         consumption_data = [0.0] * period_count
@@ -1858,97 +2158,72 @@ class BatterySystemManager:
 
         return optimization_period, optimization_data
 
-    def _calculate_terminal_value(
+    def _calculate_terminal_curve(
         self,
         buy_prices: list[float],
-        sell_prices: list[float],
+        cap_sell_prices: list[float],
         optimization_period: int,
-    ) -> float:
-        """Calculate terminal value per kWh for the DP optimization.
+    ) -> TerminalValueCurve | None:
+        """Build the concave terminal row for the DP (#602).
 
-        Estimate value from the median buy price (over whatever horizon window
-        the caller passed in) adjusted for efficiency and cycle cost ("avoid a
-        future purchase"), capped at the best achievable in-horizon export
-        value ("arbitrage-consistency cap"). This applies at either horizon
-        boundary, midnight-today or midnight-tomorrow:
-        the caller already truncates buy_prices/sell_prices to the current
-        optimization window, so the median/cap formula reflects genuine
-        future price uncertainty beyond that window regardless of where it
-        ends (#345).
+        The economics live in `core/bess/terminal_value.py` so that production,
+        the forecast-robustness harness and the pinned scenario corpus price the
+        boundary identically -- see that module for the full rationale (#126,
+        #244, #246, #345, #359, #422, #602). This method owns fetching the
+        inputs and reporting the result; it does not own the economics.
 
-        `sell_prices` is expected to be scoped by the caller to the terminal
-        boundary's own calendar day, not the full remaining horizon (#422):
-        on a 48h-extended horizon, using the full window lets an
-        already-committed near-term peak (e.g. today's still-upcoming best
-        sell slot) inflate the cap for a later, economically unrelated day's
-        terminal energy, making the DP hold charge through that day's own
-        (lower) export opportunities instead of exporting into them.
-        `buy_prices` is unaffected -- it feeds a median, which is already
-        resistant to a single-period outlier.
+        The knee needs next-day consumption and solar, which is why this takes
+        forecasts where its predecessor took only prices. Both are already
+        fetched for the optimization itself, so nothing new is polled.
 
-        The cap is required because cycle cost is only ever charged on
-        charging, never on discharge (see `_compute_reward`): an uncapped
-        buy-median terminal value can exceed the best real, known export price
-        already visible inside today's horizon, which makes the DP hold charge
-        to chase a fictitious future bonus instead of exporting now (#126,
-        #244). The cap is self-calibrating from data the DP already has, so it
-        collapses on wide-spread contracts (e.g. Belgian ENTSO-e/Belpex)
-        without needing a market-specific threshold, and stays inert on
-        ordinary/Nordic-shaped markets where the best in-horizon peak is
-        already above the buy-median estimate (#246, supersedes #245).
-
-        The cap is skipped when the export tariff is fixed. It bounds terminal
-        value by an export opportunity the DP would forgo by holding charge,
-        but on a flat sell curve `max(sell_prices)` is not an opportunity to
-        forgo — it is the price available in every period, including the
-        current one, which each period's reward already prices in. Applying it
-        there double-counts the immediate export alternative and makes storing
-        surplus solar for post-horizon use arithmetically impossible for *any*
-        future price, since the cap forces
-        `terminal <= sell * efficiency_discharge < sell < sell / efficiency_charge`
-        — the round-trip breakeven that storing has to clear (#359).
+        Alignment, stated because it is a real approximation and not an
+        oversight: `knee_kwh_from_forecast` wants arrays anchored at the
+        terminal boundary. On a single-day horizon that boundary is midnight
+        tonight and tomorrow's forecasts are exactly right. On a 48h-extended
+        horizon -- every afternoon once tomorrow's prices land -- the boundary
+        is midnight *tomorrow*, and the day after has no forecast at all:
+        Solcast publishes tomorrow, and the consumption profile is a
+        time-of-day shape with no notion of which day it describes. Tomorrow's
+        PV is therefore used as the stand-in for the day after's. The error is
+        one of amplitude, not shape -- sunrise moves by minutes day to day,
+        while the knee is an integral up to sunrise -- so it mis-sizes the carry
+        on a day whose weather differs sharply from the next, and never
+        mis-times it. #422 shows this codebase treats "which day is the terminal
+        day" as load-bearing for *prices*, where a single peak can move a cap;
+        an integral to sunrise has no such sensitivity.
 
         Args:
             buy_prices: Full buy price array (from optimization_period onwards)
-            sell_prices: Full sell price array (from optimization_period onwards)
             optimization_period: Current optimization starting period
 
         Returns:
-            Terminal value per kWh (floored at 0.0)
+            The terminal curve, or None when no horizon remains to value.
         """
-        # Estimate terminal value using median (resistant to peak price outliers)
+        # A horizon with no remaining periods is an expected state here (the
+        # last optimization of the day), and there is nothing left to value.
+        # The shared formula deliberately raises on empty input instead of
+        # defaulting, so this case is owned here rather than there.
         if not buy_prices:
-            return 0.0
+            return None
 
-        median_price = statistics.median(buy_prices)
-        max_sell_price = max(sell_prices)
-        buy_based = max(
-            0.0,
-            median_price * self.battery_settings.efficiency_discharge
-            - self.battery_settings.cycle_cost_per_kwh,
+        curve = calculate_terminal_curve(
+            buy_prices,
+            cap_sell_prices,
+            self._get_consumption_forecast(),
+            self._fetch_tomorrow_solar_forecast(),
+            self.battery_settings,
         )
-        sell_cap = max(
-            0.0,
-            max_sell_price * self.battery_settings.efficiency_discharge
-            - self.battery_settings.cycle_cost_per_kwh,
-        )
-        export_prices_vary = max_sell_price > min(sell_prices)
-        terminal_value = min(buy_based, sell_cap) if export_prices_vary else buy_based
 
         logger.info(
-            "Terminal value: %.3f/kWh (buy_based=%.3f, sell_cap=%.3f, "
-            "cap_applied=%s, median_buy=%.3f, max_sell=%.3f, "
-            "efficiency=%.2f, cycle_cost=%.3f)",
-            terminal_value,
-            buy_based,
-            sell_cap,
-            export_prices_vary,
-            median_price,
-            max_sell_price,
+            "Terminal curve: %.3f/kWh up to %.2f kWh, then %.3f/kWh "
+            "(median_buy=%.3f, efficiency=%.2f)",
+            curve.head_rate,
+            curve.knee_kwh,
+            curve.tail_rate,
+            curve.head_rate / self.battery_settings.efficiency_discharge,
             self.battery_settings.efficiency_discharge,
-            self.battery_settings.cycle_cost_per_kwh,
         )
-        return terminal_value
+        return curve
 
     def _get_temperature_derated_charge_limits(
         self, num_periods: int
@@ -2010,6 +2285,19 @@ class BatterySystemManager:
 
         return derated_limits
 
+    def _extract_buy_sell_prices(
+        self, entries: list[dict[str, Any]]
+    ) -> tuple[list[float], list[float]]:
+        """Split pre-calculated price entries into buy and sell price lists.
+
+        Mirrors the extraction inside ``_run_optimization`` so the apply path
+        can reproduce the DP results table when the schedule changes.
+        """
+        return (
+            [entry["buyPrice"] for entry in entries],
+            [entry["sellPrice"] for entry in entries],
+        )
+
     def _run_optimization(
         self,
         optimization_period: int,
@@ -2061,8 +2349,7 @@ class BatterySystemManager:
             # Get buy and sell prices from pre-calculated price entries
             # This preserves direct sell prices from sources like Octopus Energy
             remaining_entries = price_entries[optimization_period:]
-            buy_prices = [entry["buyPrice"] for entry in remaining_entries]
-            sell_prices = [entry["sellPrice"] for entry in remaining_entries]
+            buy_prices, sell_prices = self._extract_buy_sell_prices(remaining_entries)
 
             # Scope the arbitrage-consistency cap to sell prices on the
             # terminal boundary's own calendar day (#422): on a 48h-extended
@@ -2072,6 +2359,8 @@ class BatterySystemManager:
             # the cap for a later, economically unrelated day's terminal
             # energy. Single-day horizons are unaffected -- the terminal day
             # is the only day present, so this is identical to sell_prices.
+            # Still needed after #602: the cap governs the no-PV regime, which
+            # is where the concave row's knee cannot bind.
             terminal_date = remaining_entries[-1]["timestamp"][:10]
             cap_sell_prices = [
                 entry["sellPrice"]
@@ -2079,8 +2368,8 @@ class BatterySystemManager:
                 if entry["timestamp"][:10] == terminal_date
             ]
 
-            # Calculate terminal value for end-of-horizon energy valuation
-            terminal_value = self._calculate_terminal_value(
+            # Terminal valuation for end-of-horizon energy.
+            terminal_curve = self._calculate_terminal_curve(
                 buy_prices, cap_sell_prices, optimization_period
             )
 
@@ -2091,18 +2380,6 @@ class BatterySystemManager:
             )
 
             # Run DP optimization with strategic intent capture - returns OptimizationResult directly
-            discharge_resolution_kw = (
-                self._inverter_controller.discharge_resolution_kw(
-                    self.battery_settings.max_discharge_power_kw
-                )
-                if self._inverter_controller is not None
-                else None
-            )
-            self_throttle_export_threshold_kwh = (
-                self._inverter_controller.self_throttle_export_threshold_kwh
-                if self._inverter_controller is not None
-                else None
-            )
             result = optimize_battery_schedule(
                 buy_price=buy_prices,
                 sell_price=sell_prices,
@@ -2112,20 +2389,18 @@ class BatterySystemManager:
                 battery_settings=self.battery_settings,
                 initial_cost_basis=initial_cost_basis,
                 period_duration_hours=0.25,  # Always quarterly after normalization in _get_price_data
-                terminal_value_per_kwh=terminal_value,
+                terminal_curve=terminal_curve,
                 currency=self.home_settings.currency,
                 max_charge_power_per_period=max_charge_power_per_period,
-                discharge_resolution_kw=discharge_resolution_kw,
-                self_throttle_export_threshold_kwh=self_throttle_export_threshold_kwh,
+                capabilities=self.platform_capabilities,
+                export_curtailment_active=self.export_curtailment_active,
+                home_settings=self.home_settings,
             )
 
             # Add timestamps to period data (algorithm is time-agnostic, operates on relative indices)
             self._add_timestamps_to_period_data(
                 result, optimization_period, next_day=prepare_next_day
             )
-
-            # Print results table with strategic intents
-            print_optimization_results(result, buy_prices, sell_prices)
 
             # Store full day data in result for UI
             result.input_data["full_home_consumption"] = optimization_data[
@@ -2343,11 +2618,30 @@ class BatterySystemManager:
                 today_base_cost = sum(
                     pd.economic.grid_only_cost for pd in today_result_periods
                 )
+                # Reported cost must reflect what will actually happen at
+                # runtime, not the honest physics-only price PeriodData
+                # itself keeps (#502) -- see the matching comment in
+                # dp_battery_algorithm.py's own battery_solar_cost
+                # aggregation for why the raw period_data_list stays
+                # untouched. today_solar_only_cost must come from the SAME
+                # curtailment-adjusted copies as today_optimized_cost, not
+                # the honest periods, or the battery-vs-solar-only savings
+                # subtraction below mixes a curtailed total against an
+                # uncurtailed baseline (code review finding).
+                today_curtailment_adjusted_periods = [
+                    apply_export_curtailment_to_period_data(
+                        pd,
+                        self.export_curtailment_active,
+                        self.battery_settings.export_curtailment_price_floor,
+                    )
+                    for pd in today_result_periods
+                ]
                 today_solar_only_cost = sum(
-                    pd.economic.solar_only_cost for pd in today_result_periods
+                    pd.economic.solar_only_cost
+                    for pd in today_curtailment_adjusted_periods
                 )
                 today_optimized_cost = sum(
-                    pd.economic.hourly_cost for pd in today_result_periods
+                    pd.economic.hourly_cost for pd in today_curtailment_adjusted_periods
                 )
                 today_charged = sum(
                     pd.energy.battery_charged for pd in today_result_periods
@@ -2495,10 +2789,6 @@ class BatterySystemManager:
         logger.info("Schedule update required: %s", reason)
         self._current_schedule = temp_schedule
 
-        # Read the currently-active TOU intervals BEFORE apply_intents
-        # rebuilds them, so write_to_hardware still sees what's on hardware
-        # right now (used for stale-segment cleanup on some platforms).
-        current_tou = self._inverter_controller.active_tou_intervals.copy()
         effective_period = 0 if prepare_next_day else period
         self._inverter_controller.apply_intents(temp_schedule, effective_period)
 
@@ -2506,8 +2796,11 @@ class BatterySystemManager:
             if self._controller is None:
                 logger.error("Cannot apply schedule: controller is not available")
             else:
-                self._inverter_controller.write_to_hardware(
-                    self._controller, effective_period, current_tou
+                # No snapshot of "what's on hardware" is passed in: platforms
+                # that need it read the inverter themselves. Passing our own
+                # pre-apply model let the two drift apart (issue #551).
+                self._inverter_controller.sync_to_hardware(
+                    self._controller, effective_period
                 )
 
             # Clear corruption flag after successful hardware write
@@ -2567,35 +2860,47 @@ class BatterySystemManager:
             )
         )
 
-        # SOLAR_EXPORT/SOLAR_STORAGE discharge gate: the optimizer's planned
-        # rate is a 15-min average, but load_first lets the battery cover an
-        # intra-period solar/load dip beyond that average. Allow that only
-        # when the stored energy is worth less than buying from grid now
-        # (shadow_price = DP marginal value of stored SoE). This is a
-        # sub-period hardware-robustness behaviour, invisible to the 15-min
-        # plan/sim. Only valid where discharge_rate is a load-following
-        # ceiling -- on platforms where it's an immediate forced power
-        # command (VPP-style control), opening the gate would force a
-        # full-power discharge instead of gently covering a dip (#324).
+        # Intra-period discharge gate: the optimizer's planned rate is a
+        # 15-min average, but load_first lets the battery cover an
+        # intra-period solar/load deficit beyond that average. Allow that only
+        # when the stored energy is worth less than buying from grid now --
+        # a comparison the DP makes where it owns the value function and
+        # records as `decision.intra_period_discharge_allowed` (#526). Only
+        # valid where discharge_rate is a load-following ceiling -- on
+        # platforms where it's an immediate forced power command (VPP-style
+        # control), opening the gate would force a full-power discharge
+        # instead of gently covering a deficit (#324).
         #
-        # For SOLAR_EXPORT/SOLAR_STORAGE the planned baseline is always 0, so
-        # the gate fully determines the outcome.
+        # `max(planned, gate)` -- the gate may only raise the ceiling, never
+        # lower an already-committed plan. For SOLAR_EXPORT/SOLAR_STORAGE the
+        # planned baseline is always 0, so the gate fully determines the
+        # outcome; LOAD_SUPPORT has a nonzero plan-scaled baseline to protect.
         #
-        # LOAD_SUPPORT deliberately does NOT use this gate (#393): #384/#385
-        # added it here, but #385's own validation against the reporting
-        # user's real captured data found the gate doesn't open during the
-        # sustained overnight near-tie regime it was built for (shadow_price
-        # sits within a cent or two of buy_price there), while a second,
-        # independent real-world report (different day, different price
-        # shape) showed the same gate condition evaluating true for the
-        # large majority of LOAD_SUPPORT periods -- a broad, mostly-untested
-        # override of the #147 reservation pacing, not the narrow safety
-        # valve it was meant to be. Reverted until a mechanism is validated
-        # against real captured data before shipping. LOAD_SUPPORT keeps its
-        # plan-scaled cap unconditionally, same as pre-#384.
+        # LOAD_SUPPORT was removed from this gate by #393 as "a broad override
+        # of the #147 reservation pacing" and re-landed by #520, because that
+        # reasoning double-counts the reservation. The DP's authorization IS
+        # a dV/dSoE comparison -- the future value the pacing protects is
+        # already inside it. Gate closed -> import, reservation protected by
+        # construction. Gate open -> the energy is worth more now than later,
+        # so there is nothing being reserved. The gate does not override
+        # reservation pacing; it evaluates it. #393's headline "the gate
+        # evaluates true for 76% of LOAD_SUPPORT periods" measured
+        # gate-OPENNESS, not pacing-override: it means that in 76% of those
+        # periods battery-now genuinely beat grid-now. (Corpus-wide, measured
+        # post-#526: the gate is open in 431/603 = 71.5% of LOAD_SUPPORT
+        # periods and raises the ceiling above the plan-scaled rate in 427 of
+        # them -- this is a broad behaviour by design, and the argument above
+        # is why that breadth is correct rather than alarming.)
+        # Read through the capability object, not off the controller
+        # directly: it is the one place the platform is interpreted, and for
+        # Solis the two used to disagree -- it declares `period_list` (no
+        # per-period rate) while inheriting the base class's load-following
+        # True, so the planner and this write path read the same hardware two
+        # different ways. Solis now declares both explicitly; routing through
+        # the capability is what keeps a future platform from re-opening it.
         if (
-            strategic_intent in ("SOLAR_EXPORT", "SOLAR_STORAGE")
-            and self._inverter_controller.discharge_rate_is_load_following
+            strategic_intent in ("SOLAR_EXPORT", "SOLAR_STORAGE", "LOAD_SUPPORT")
+            and self.platform_capabilities.discharge_rate_is_load_following
         ):
             # Resolved by exact timestamp (not positional index -
             # optimization_period) so the standalone next-day schedule
@@ -2604,17 +2909,63 @@ class BatterySystemManager:
             target_timestamp = time_utils.period_index_to_timestamp(period)
             period_data = self.schedule_store.get_period_data_at(target_timestamp)
             if period_data is not None:
-                shadow = period_data.decision.shadow_price
-                buy_prices, _ = self.price_manager.get_available_prices()
-                if period < len(buy_prices):
-                    discharge_rate = max(
-                        discharge_rate,
-                        intra_period_discharge_gate(
-                            buy_prices[period],
-                            shadow,
-                            self.battery_settings.efficiency_discharge,
-                        ),
+                discharge_rate = max(
+                    discharge_rate,
+                    intra_period_discharge_gate(
+                        period_data.decision.intra_period_discharge_allowed
+                    ),
+                )
+
+        # PV export-limit curtailment (issue #269): opt-in, platform-agnostic
+        # decision — curtail whenever this period is exporting at a sell
+        # price below the configured floor, regardless of strategic_intent
+        # (the reporting evidence showed the "battery full" case classifies
+        # as SOLAR_STORAGE, not SOLAR_EXPORT, since the battery is still
+        # charging at its rate limit while the surplus above that rate
+        # exports). No-op on platforms without supports_export_limit_control
+        # via InverterController.apply_export_limit's base implementation.
+        #
+        # The write is skipped only when there's genuinely nothing to assert:
+        # no export this period AND the hardware isn't currently curtailed.
+        # Any exporting period actively (re)asserts the correct state either
+        # way, and _export_limit_curtailed additionally forces a release on
+        # a later *non*-exporting period that would otherwise leave an
+        # earlier curtailment stuck on with no further write to clear it.
+        #
+        # A write failure here (e.g. an unconfigured entity) must not take
+        # down the rest of this period's hardware apply below.
+        if self.battery_settings.export_curtailment_enabled:
+            target_timestamp = time_utils.period_index_to_timestamp(period)
+            period_data = self.schedule_store.get_period_data_at(target_timestamp)
+            if period_data is not None and (
+                period_data.energy.grid_exported > 0 or self._export_limit_curtailed
+            ):
+                should_curtail = self.battery_settings.should_curtail_export(
+                    period_data.energy.grid_exported,
+                    period_data.economic.sell_price,
+                )
+                try:
+                    self._inverter_controller.apply_export_limit(
+                        self.controller, should_curtail
                     )
+                    self._export_limit_curtailed = should_curtail
+                    self._runtime_failure_tracker.dismiss_by_category(
+                        "export_limit_curtailment"
+                    )
+                except Exception as e:
+                    # ha_api_controller's own retry logic already records a
+                    # failure under this same category via record_failure_once
+                    # for HTTP-level errors, so use record_failure_once here
+                    # too (rather than record_failure) to coalesce with it
+                    # instead of producing a second banner entry for one
+                    # underlying failure.
+                    self._runtime_failure_tracker.record_failure_once(
+                        category="export_limit_curtailment",
+                        operation=f"Period {period}: apply export-limit curtailment",
+                        error=e,
+                    )
+
+        at_reserve_floor = self._at_reserve_floor()
 
         # Store the schedule's desired discharge rate before inhibit check so that
         # apply_discharge_inhibit() can restore it when the inhibit sensor clears.
@@ -2665,6 +3016,7 @@ class BatterySystemManager:
             discharge_rate,
             block_passive_charging,
             strategic_intent,
+            at_reserve_floor,
         )
 
         if not success:
@@ -2690,6 +3042,51 @@ class BatterySystemManager:
 
         # Apply charging power rate (BSM-level concern: uses power monitor)
         self.adjust_charging_power()
+
+    def _at_reserve_floor(self) -> bool:
+        """Whether the battery is sitting on its reserve floor right now (#592).
+
+        Read live rather than taken from the plan: an IDLE hold exists to
+        protect stored energy from self-consumption, so what decides whether
+        the hold is worth anything is whether energy is actually there now. A
+        plan that expected a reserve does not mean one survived.
+
+        Called fresh at each write, including retries minutes later, for the
+        same reason -- a captured flag would command the inverter on a SoC
+        that has since moved.
+
+        The SoE conversion deliberately mirrors `min_soe_kwh`'s own
+        (`total_capacity * pct / 100`, settings.py) rather than the equivalent
+        `pct / 100 * total_capacity`. The two can differ in the last bit, and
+        the case that decides this branch is exact equality -- a battery
+        parked on its floor overnight, which is precisely the reported
+        scenario.
+
+        **An unreadable SoC holds, and says so.** `get_battery_soc()` is
+        `float | None`, so a transient unavailable/unknown sensor must be
+        decided here rather than propagating: this runs for every platform on
+        every period write, and two of its callers (the retry closure's
+        apscheduler job and the every-minute discharge-inhibit job) have no
+        exception handling at all, so raising would take down far more than
+        this flag. Holding is chosen over releasing because it is the safe
+        direction and is exactly the pre-#592 behaviour -- releasing is what
+        could let the inverter's own self-use draw the battery down, so it
+        must never happen on a reading we could not verify. This is an
+        explicit, logged branch, not a silent fallback: rules.md forbids
+        degrading quietly, not choosing a safe outcome loudly.
+
+        Validation is `_get_current_battery_soc()`'s, reused rather than
+        restated, so the definition of a valid reading stays in one place.
+        """
+        soc = self._get_current_battery_soc()
+        if soc is None:
+            logger.warning(
+                "Reserve-floor check: SoC unreadable — holding the battery "
+                "(not releasing VPP control) until a valid reading returns"
+            )
+            return False
+        current_soe = self.battery_settings.total_capacity * soc / 100.0
+        return current_soe <= self.battery_settings.min_soe_kwh
 
     _PERIOD_RETRY_DELAYS_MIN: ClassVar[list[int]] = [
         3,
@@ -2739,6 +3136,7 @@ class BatterySystemManager:
                 discharge_rate,
                 block_passive_charging,
                 strategic_intent,
+                self._at_reserve_floor(),
             )
             self._runtime_failure_tracker.dismiss_by_category("period_apply")
             if not success:
@@ -2859,13 +3257,21 @@ class BatterySystemManager:
 
             # Handle charging using stored facts
             if event.energy.battery_charged > 0:
-                # Simple calculation using stored energy flows
-                solar_to_battery = min(
-                    event.energy.battery_charged, event.energy.solar_production
-                )
-                grid_to_battery = max(
-                    0, event.energy.battery_charged - solar_to_battery
-                )
+                # Read the split `EnergyData` already derived; never re-derive
+                # it. This site used to compute its own
+                # `min(battery_charged, solar_production)`, which ignores the
+                # house load and so counts solar the home already consumed as
+                # having charged the battery -- booking grid energy as free.
+                # Measured over the fixture corpus before the fix: 31 of 419
+                # charging periods disagreed, 36.16 kWh of grid charging
+                # booked as solar across 10 of 36 fixtures, worst single
+                # period 5.2 kWh (solar 5.8, home 5.2, charged 6.0 -- the
+                # whole 5.8 kWh of solar counted to the battery while the home
+                # was consuming 5.2 of it). The understated basis then fed
+                # `optimize_battery_schedule(initial_cost_basis=...)`, making
+                # stored energy look cheaper to discharge than it was.
+                solar_to_battery = event.energy.solar_to_battery
+                grid_to_battery = event.energy.grid_to_battery
 
                 # Calculate costs using same logic as everywhere else
                 solar_cost = solar_to_battery * self.battery_settings.cycle_cost_per_kwh
@@ -2873,7 +3279,69 @@ class BatterySystemManager:
                     event.economic.buy_price + self.battery_settings.cycle_cost_per_kwh
                 )
 
-                new_energy_cost = solar_cost + grid_cost
+                # On exact (planned/simulated) data the two attributed flows
+                # sum to battery_charged exactly. On measured data
+                # `grid_to_battery` is capped by the grid counter's own
+                # reading (`EnergyData`'s non-invention rule), so the two can
+                # sum to LESS than what the battery recorded taking in.
+                #
+                # That remainder is priced at the GRID price, not at cycle
+                # cost. A battery charges from solar or from the grid; there is
+                # no third source. If `solar_to_battery` cannot account for the
+                # energy then the grid supplied it and the grid *counter*
+                # under-read, so what it cost is what grid energy costs.
+                #
+                # Pricing it at cycle cost instead (an earlier revision of this
+                # fix) is strictly worse than the formula being replaced here:
+                # the retired split assigned every kWh above solar to the grid
+                # at buy price, so on a period with an under-reading counter
+                # that "fix" priced the energy CHEAPER than the bug did --
+                # understating the basis, which is the exact failure Task 4
+                # exists to close. Degenerately, a reset grid counter during
+                # grid charging would have booked the whole charge as nearly
+                # free. Caught in review on this repo's own evidence bundle,
+                # `historical_2026_07_18_charge_attribution.json` period 39.
+                #
+                # Known limitation, measured rather than assumed: during
+                # DELIBERATE grid charging (`battery_first`) this split is the
+                # wrong way round. `EnergyData` allocates solar to the home
+                # first, which is right for load_first surplus charging, but in
+                # battery_first the PV is DC-coupled straight to the battery and
+                # the house runs off the grid -- so solar that really did charge
+                # the battery gets booked to the home, and the battery's charge
+                # gets booked entirely to the grid. The retired formula happened
+                # to be the accurate one in that regime.
+                #
+                # Not fixed here because the trade is measured and lopsided.
+                # Across the 30 debug bundles in `docs/`: load_first charging is
+                # 264 periods / 191.1 kWh where this correction ADDS 55.15 SEK
+                # of correctly-attributed cost, against 26 GRID_CHARGING periods
+                # / 30.3 kWh where it overstates by 3.85 SEK -- and overstating
+                # makes the DP more reluctant to discharge, which forfeits
+                # margin rather than losing money. Making the split regime-aware
+                # (keying off `decision.strategic_intent`) is the real fix and a
+                # modelling decision in its own right, not a Phase 3 consolidation.
+                #
+                # Second known asymmetry: this can only push the basis UP.
+                # A grid counter that under-reads leaves a positive remainder
+                # priced here at buy price, while one that over-reads is
+                # absorbed into `grid_to_home` upstream and leaves nothing, so
+                # rounding never nets out. Measured on that bundle the bias is
+                # +0.003 SEK/kWh (0.9844 -> 0.9875) over a day, but it scales
+                # with charging periods and with buy price. Accepted because
+                # the direction is the safe one -- an overstated basis makes
+                # the DP more reluctant to discharge, never less -- and because
+                # the retired formula priced the same energy at buy price too,
+                # uncapped, so this is not a regression against it.
+                unattributed = max(
+                    0.0,
+                    event.energy.battery_charged - solar_to_battery - grid_to_battery,
+                )
+                unattributed_cost = unattributed * (
+                    event.economic.buy_price + self.battery_settings.cycle_cost_per_kwh
+                )
+
+                new_energy_cost = solar_cost + grid_cost + unattributed_cost
                 running_total_cost += new_energy_cost
                 running_energy += event.energy.battery_charged
 
@@ -2970,14 +3438,16 @@ class BatterySystemManager:
 
             if critical_failures:
                 logger.error(
-                    f"⚠️ SYSTEM DEGRADED: Critical sensor failures detected in required components: {', '.join(critical_failures)}"
+                    f"⚠️ SYSTEM DEGRADED: required components failing: {', '.join(critical_failures)}"
                 )
                 logger.error(
                     "⚠️ System will start in degraded mode. Some functionality may not work correctly."
                 )
-                logger.error(
-                    "⚠️ Please fix sensor configuration for full functionality."
-                )
+                # Deliberately does not tell the user to fix their configuration:
+                # a required component also fails when an upstream source is
+                # temporarily unavailable, and blaming the config sent a user
+                # hunting a Nordpool misconfiguration that did not exist (#583).
+                logger.error("⚠️ See the Health page for which check failed and why.")
                 # Store critical failures for UI to display
                 self._critical_sensor_failures = critical_failures
             else:
@@ -2996,35 +3466,78 @@ class BatterySystemManager:
     def _update_health_recoveries(
         self, previous_results: dict[str, Any] | None, new_results: dict[str, Any]
     ) -> None:
-        """Detect per-component ERROR/WARNING -> OK transitions and record them.
+        """Detect device-level ERROR/WARNING -> OK transitions and record them.
 
-        A component still in ERROR/WARNING clears any stale pending recovery
-        for itself, since the live banner already covers it.
+        A single underlying device outage fails several health components at
+        once, so recoveries are tracked per device, not per component: one
+        recovery line per recovered device, naming the components that
+        recovered. A device any of whose components still fails clears any
+        stale pending recovery for itself — the live banner already covers
+        that device.
         """
         if not previous_results:
             return
+
+        # Health checks (the caller of this method) already dereference
+        # self._controller, so it is never None here.
+        assert self._controller is not None
+        try:
+            entity_to_device, device_names = self._controller.get_device_maps()
+        except SystemConfigurationError as e:
+            logger.warning(
+                "HA device registry unavailable, grouping recoveries by "
+                "component name: %s",
+                e,
+            )
+            entity_to_device, device_names = {}, {}
 
         previous_components_by_name = {
             component["name"]: component
             for component in previous_results.get("checks", [])
         }
 
+        def _device_of(component: dict) -> str:
+            return resolve_component_device(component, entity_to_device, device_names)
+
+        # Devices with a component still failing: their live banner lines
+        # supersede any pending "recovered" note, which must not linger.
+        failing_devices = {
+            _device_of(component)
+            for component in new_results.get("checks", [])
+            if component.get("status") in ("ERROR", "WARNING")
+        }
+        for device in failing_devices:
+            self._health_recovery_tracker.clear_for_component(device)
+
+        # Components that recovered. Resolve the device from the PREVIOUS
+        # component, which still carries the failing entity_ids — the new OK
+        # component may have empty checks.
+        recovered_by_device: dict[str, list[dict]] = {}
         for component in new_results.get("checks", []):
-            name = component["name"]
-            new_status = component["status"]
-            previous_component = previous_components_by_name.get(name)
+            previous_component = previous_components_by_name.get(component["name"])
             previous_status = (
                 previous_component["status"] if previous_component else None
             )
+            if (
+                previous_component is not None
+                and previous_status in ("ERROR", "WARNING")
+                and component["status"] == "OK"
+            ):
+                device = _device_of(previous_component)
+                recovered_by_device.setdefault(device, []).append(component)
 
-            if previous_status in ("ERROR", "WARNING") and new_status == "OK":
-                self._health_recovery_tracker.record_recovery(
-                    component=name,
-                    previous_status=previous_status,
-                    detail=describe_failing_checks(previous_component),
-                )
-            elif new_status in ("ERROR", "WARNING"):
-                self._health_recovery_tracker.clear_for_component(name)
+        for device, components in recovered_by_device.items():
+            if device in failing_devices:
+                continue
+            previous_statuses = [
+                previous_components_by_name[c["name"]]["status"] for c in components
+            ]
+            worst = "ERROR" if "ERROR" in previous_statuses else "WARNING"
+            self._health_recovery_tracker.record_recovery(
+                component=device,
+                previous_status=worst,
+                detail=", ".join(c["name"] for c in components),
+            )
 
     def get_health_recoveries(self) -> list[HealthRecovery]:
         """Get all pending (unacknowledged) health-check recoveries."""
@@ -3105,6 +3618,23 @@ class BatterySystemManager:
         """
         return self._runtime_failure_tracker.dismiss_all()
 
+    def record_scheduler_misfire(self, job_id: str, scheduled_run_time) -> None:
+        """Record a scheduler job whose fire time was missed (dropped, not run).
+
+        APScheduler's default coalesce behavior silently drops a misfired run
+        with no log line (issue #403) — this makes it visible via the same
+        runtime-failure banner used for hardware-write failures.
+        """
+        run_time_str = scheduled_run_time.strftime("%H:%M")
+        self._runtime_failure_tracker.record_failure(
+            category="scheduler_misfire",
+            operation=(
+                f"Scheduled job '{job_id}' missed its {run_time_str} run "
+                f"(previous run still busy) and was dropped"
+            ),
+            error=Exception(f"Job '{job_id}' misfire at {run_time_str}"),
+        )
+
     def dismiss_historical_data_warning(self, missing_hours: list[int]) -> None:
         """Dismiss the historical-data-incomplete warning for today.
 
@@ -3145,6 +3675,15 @@ class BatterySystemManager:
         """Getter for price_manager to ensure API compatibility."""
         return self._price_manager
 
+    def refresh_prices(self) -> None:
+        """Refresh the electricity-price cache off the optimizer's critical path.
+
+        Public wrapper for the dedicated price-refresh scheduler job (app.py).
+        The quarterly optimizer reads the cache only and never fetches on the
+        scheduler thread (#709).
+        """
+        self._price_manager.refresh_cache()
+
     def get_current_daily_view(self, current_period: int | None = None) -> DailyView:
         """Get daily view for specified or current period.
 
@@ -3172,7 +3711,35 @@ class BatterySystemManager:
                 )
 
         # Build daily view with current period
-        return self.daily_view_builder.build_daily_view(current_period)
+        return self.daily_view_builder.build_daily_view(
+            current_period, self.export_curtailment_active
+        )
+
+    def _persist_today_view(self) -> None:
+        """Best-effort snapshot of today's merged view to disk.
+
+        Write-through cache for HistoricalDataStore: called on every tick
+        that may have recorded new actuals, so a mid-day restart can seed
+        from disk instead of relying solely on the recorder backfill. No-op
+        until the first schedule of the day exists (build_daily_view raises
+        ValueError otherwise) — this mirrors the is_first_run skip that used
+        to gate the old 23:55-only save call.
+
+        Never lets a disk-related failure propagate: this is called from
+        _update_energy_data on every tick, and an uncaught exception here
+        would abort that tick's optimization and hardware write.
+        """
+        # Skip during BESS_HISTORICAL_SEED_FILE replay (see _load_historical_seed):
+        # persisting replayed fixture data to /data/daily_views would corrupt
+        # real disk state for a test/E2E run.
+        if os.environ.get("BESS_HISTORICAL_SEED_FILE", ""):
+            return
+        if self.schedule_store.get_latest_schedule() is None:
+            return
+        try:
+            self.daily_view_store.save_day(self.get_current_daily_view())
+        except Exception as e:
+            logger.warning("Failed to persist today's view: %s", e)
 
     def adjust_charging_power(self) -> None:
         """Adjust charging power based on house consumption.
@@ -3200,7 +3767,16 @@ class BatterySystemManager:
                 # preceding LOAD_SUPPORT or BATTERY_EXPORT period).
                 self.controller.set_charging_power_rate(int(charge_rate))
 
-        except (AttributeError, ValueError, KeyError) as e:
+        except (
+            AttributeError,
+            ValueError,
+            KeyError,
+            requests.RequestException,
+        ) as e:
+            # RequestException: grid_charge_enabled() reads through
+            # _api_request, which re-raises once its retries are exhausted.
+            # A transient HA failure skips this tick rather than escaping to
+            # APScheduler; the inverter keeps its current rate (issue #643).
             logger.error("Failed to adjust charging power: %s", str(e))
 
     def apply_discharge_inhibit(self) -> None:
@@ -3240,6 +3816,10 @@ class BatterySystemManager:
             target_rate,
             self._desired_block_passive_charging,
             self._desired_strategic_intent,
+            # Fresh, not the value from the scheduled write: this runs
+            # mid-period, and omitting it would default to False and
+            # re-assert the battery_first hold #592 released.
+            self._at_reserve_floor(),
         )
         self._last_applied_discharge_rate = target_rate
 
@@ -3326,7 +3906,7 @@ class BatterySystemManager:
         """Log the current battery configuration - reproduces original functionality."""
         try:
             # Use already-fetched predictions — avoids triggering a heavy pipeline
-            # (InfluxDB query or ML inference) just for a log message
+            # (recorder query or ML inference) just for a log message
             assert self._consumption_predictions is not None
             predictions_consumption = self._consumption_predictions
 
@@ -3406,6 +3986,8 @@ class BatterySystemManager:
                     "grid_export": period_info.energy.grid_exported,
                     "battery_charged": period_info.energy.battery_charged,
                     "battery_discharged": period_info.energy.battery_discharged,
+                    "solar_to_battery": period_info.energy.solar_to_battery,
+                    "grid_to_battery": period_info.energy.grid_to_battery,
                     "battery_soe_end": period_info.energy.battery_soe_end,
                     "battery_net_change": (
                         period_info.energy.battery_charged
@@ -3464,9 +4046,13 @@ class BatterySystemManager:
         for data in period_data:
             energy_in = data["grid_import"] + data["solar_production"]
 
-            # Estimate solar to battery (simplified)
-            solar_to_battery = min(data["battery_charged"], data["solar_production"])
-            grid_to_battery = max(0, data["battery_charged"] - solar_to_battery)
+            # The split `EnergyData` derived, not a second estimate of it.
+            # This column used to re-derive `min(battery_charged,
+            # solar_production)`, which ignores the house load and so showed
+            # grid charging as solar -- the same defect the cost basis
+            # carried, displayed to the user.
+            solar_to_battery = data["solar_to_battery"]
+            grid_to_battery = data["grid_to_battery"]
 
             # Mark predictions with ★ (periods >= current_period)
             indicator = "★" if data["period"] >= current_period else " "

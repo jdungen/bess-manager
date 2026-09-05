@@ -20,15 +20,16 @@ class SolaxMockController(MockHomeAssistantController):
         self.vpp_disabled_count: int = 0
         self.min_soc_set: list[int] = []
         self.power_control_mode: str | None = "Self Use Mode"
-        self.sensors.update(
-            {
-                "solax_power_control_mode": "select.solax_remotecontrol_power_control",
-                "solax_active_power": "number.solax_remotecontrol_active_power",
-                "solax_autorepeat_duration": "number.solax_remotecontrol_autorepeat_duration",
-                "solax_power_control_trigger": "button.solax_remotecontrol_trigger",
-                "solax_battery_min_soc": "number.solax_battery_minimum_capacity",
-            }
-        )
+        # Already seeded by MockHomeAssistantController.__init__, but restated
+        # here for clarity since this subclass depends on them.
+        self.sensors = {
+            **self.sensors,
+            "solax_power_control_mode": "select.solax_remotecontrol_power_control",
+            "solax_active_power": "number.solax_remotecontrol_active_power",
+            "solax_autorepeat_duration": "number.solax_remotecontrol_autorepeat_duration",
+            "solax_power_control_trigger": "button.solax_remotecontrol_trigger",
+            "solax_battery_min_soc": "number.solax_battery_minimum_capacity",
+        }
 
     def set_solax_active_power_control(self, watts: int) -> None:
         self.vpp_calls.append(watts)
@@ -148,15 +149,15 @@ class TestSolaxGridChargeAtMaxPower:
 
 
 class TestSolaxNoTouHardwareWrites:
-    def test_write_to_hardware_is_noop(self) -> None:
+    def test_sync_to_hardware_is_noop(self) -> None:
         bsm, hw = _make_bsm_solax()
         intents = ["IDLE"] * 96
         intents[PERIOD] = "GRID_CHARGING"
         bsm._inverter_controller.strategic_intents = intents
 
-        # write_to_hardware should not call any hardware method
-        writes, disables = bsm._inverter_controller.write_to_hardware(
-            hw, effective_period=0, current_tou=[]
+        # sync_to_hardware should not call any hardware method
+        writes, disables = bsm._inverter_controller.sync_to_hardware(
+            hw, effective_period=0
         )
 
         assert writes == 0

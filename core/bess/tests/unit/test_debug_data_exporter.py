@@ -21,6 +21,7 @@ from core.bess.debug_data_exporter import (
     _scrub_device,
 )
 from core.bess.models import EnergyData, PeriodData
+from core.bess.settings import BatterySettings
 
 
 class TestIsSecretKey:
@@ -67,6 +68,47 @@ class TestRedactSecrets:
         assert _redact_secrets("plain") == "plain"
         assert _redact_secrets(42) == 42
         assert _redact_secrets(None) is None
+
+
+class TestSerializeAddonOptions:
+    """Settings go through the same redaction pass as the export's other
+    sections, with InfluxDB's two fields still stripped by name.
+    """
+
+    def _serialize(self, settings: dict) -> dict:
+        aggregator = DebugDataAggregator(MagicMock(), settings_data=settings)
+        return aggregator._serialize_addon_options()
+
+    def test_secret_named_value_is_redacted(self):
+        out = self._serialize(
+            {"some_section": {"api_key": "value-here", "enabled": True}}
+        )
+        assert out["some_section"]["api_key"] == _REDACTED
+        assert out["some_section"]["enabled"] is True
+
+    def test_influxdb_credentials_still_stripped_url_kept(self):
+        out = self._serialize(
+            {
+                "influxdb": {
+                    "url": "http://homeassistant.local:8086",
+                    "username": "u",
+                    "password": "p",
+                }
+            }
+        )
+        assert out["influxdb"] == {"url": "http://homeassistant.local:8086"}
+
+    def test_non_secret_settings_survive_unchanged(self):
+        settings = {
+            "sensors": {"shared": {"current_l1": "sensor.l1"}},
+            "home": {"max_fuse_current": 20},
+        }
+        assert self._serialize(settings) == settings
+
+    def test_caller_settings_not_mutated(self):
+        settings = {"some_section": {"api_key": "value-here"}}
+        self._serialize(settings)
+        assert settings["some_section"]["api_key"] == "value-here"
 
 
 class TestRedactIdentifiers:
@@ -280,6 +322,31 @@ def _make_energy() -> EnergyData:
     )
 
 
+class TestSerializeBatterySettings:
+    def _make_aggregator(self, battery_settings, export_curtailment_active):
+        agg = DebugDataAggregator.__new__(DebugDataAggregator)
+        agg.system = MagicMock()
+        agg.system.battery_settings = battery_settings
+        agg.system.export_curtailment_active = export_curtailment_active
+        return agg
+
+    def test_includes_resolved_export_curtailment_active(self):
+        # enabled=True but the platform can't curtail: the exported dict must
+        # carry the resolved flag so from_debug_log.py doesn't have to guess
+        # it from the enabled bit.
+        settings = BatterySettings(export_curtailment_enabled=True)
+        agg = self._make_aggregator(settings, export_curtailment_active=False)
+        out = agg._serialize_battery_settings()
+        assert out["export_curtailment_enabled"] is True
+        assert out["export_curtailment_active"] is False
+
+    def test_active_true_when_enabled_and_supported(self):
+        settings = BatterySettings(export_curtailment_enabled=True)
+        agg = self._make_aggregator(settings, export_curtailment_active=True)
+        out = agg._serialize_battery_settings()
+        assert out["export_curtailment_active"] is True
+
+
 class TestSerializePreviousDays:
     def _make_aggregator(self, daily_view_store):
         agg = DebugDataAggregator.__new__(DebugDataAggregator)
@@ -329,8 +396,8 @@ class TestSerializeEntitySnapshot:
     registers, both resolved via _get_entity_for_service/_resolve_entity_id,
     which look up controller.sensors directly, bypassing METHOD_SENSOR_MAP.
     Fixed by capturing controller.sensors directly instead. (controller.sensors
-    itself is kept fresh by BESSController.refresh_active_sensors(), see #332
-    — the exporter can rely on it without needing its own freshness plumbing.)
+    is a live SettingsStore view, see #334 — the exporter can rely on it
+    without needing its own freshness plumbing.)
     """
 
     def _make_aggregator(self, controller):

@@ -99,30 +99,70 @@ CI runs automatically on every PR and push to `main` (`.github/workflows/ci.yml`
 The E2E job runs Playwright tests covering API contract validation, page-level
 rendering, and the setup wizard flow. It starts in two phases:
 1. **Normal day** — tests all pages, API contracts, and navigation
-2. **Wizard** — runs the setup wizard against 7 scenario combinations
+2. **Growatt VPP** — verifies a fresh-install VPP-mode schedule build completes without error (regression for #399, #469)
+3. **Wizard** — runs the setup wizard against every scenario combination in the table below
 
 ### Wizard Scenario Matrix
 
 Each scenario boots a fresh mock-HA + BESS stack with different integrations
 installed, validating that discovery, auto-selection, and the full wizard flow
-work for every supported configuration.
+work for every supported configuration. Generated from `e2e/tests/wizard-expectations.ts`
+(the source of truth CI actually asserts against) — do not hand-edit this table
+without re-deriving it from that file, since a wrong value here can silently
+mask a wrong value there.
 
-| # | Scenario | Pricing | Inverter | Phase | Solcast | Cons.F | Disch.Inhib | Weather |
-|---|----------|---------|----------|-------|---------|--------|-------------|---------|
-| 1 | `ci-wizard-nordpool-min` | Nordpool Official | MIN | 3 | - | - | - | - |
-| 2 | `ci-wizard-nordpool-sph` | Nordpool Official | SPH | 3 | - | - | - | - |
-| 3 | `ci-wizard-octopus` | Octopus | MIN | - | - | - | - | - |
-| 4 | `ci-wizard-full` | Nordpool Official | MIN | 3 | YES | YES | YES | YES |
-| 5 | `ci-wizard-nordpool-hacs` | Nordpool HACS | MIN | 1 | YES | - | - | YES |
-| 6 | `ci-wizard-octopus-sph` | Octopus | SPH | 3 | - | YES | YES | - |
-| 7 | `ci-wizard-both-providers` | Nordpool + Octopus | MIN | 1 | - | - | YES | YES |
+| Scenario | Pricing | Inverter | Phase | Solcast | Cons.F | Disch.Inhib | Weather |
+|----------|---------|----------|-------|---------|--------|-------------|---------|
+| `ci-wizard-nordpool-min` | Nordpool Official | MIN (Cloud) | 3 | - | - | - | - |
+| `ci-wizard-nordpool-sph` | Nordpool Official | SPH (Cloud) | 3 | - | - | - | - |
+| `ci-wizard-nordpool-solax` | Nordpool Official | SolaX Native | - | - | - | - | - |
+| `ci-wizard-octopus` | Octopus | MIN (Cloud) | - | - | - | - | - |
+| `ci-wizard-entsoe` | ENTSO-e | MIN (Cloud) | - | - | - | - | - |
+| `ci-wizard-entsoe-frank-126` | ENTSO-e | MIN (SolaX Modbus) | 3 | YES | - | - | - |
+| `ci-wizard-full` | Nordpool Official | MIN (Cloud) | 3 | YES | YES | YES | YES |
+| `ci-wizard-nordpool-hacs` | Nordpool HACS | MIN (Cloud) | 1 | YES | - | - | YES |
+| `ci-wizard-growatt-sph-cloud-octopus` | Octopus | SPH (Cloud) | - | - | - | - | - |
+| `ci-wizard-both-providers` | Nordpool + Octopus | MIN (Cloud) | 1 | - | - | YES | YES |
+| `ci-wizard-growatt-modbus` | Nordpool Official | MIN (Cloud) — auto-selects Growatt Cloud even though SolaX Modbus is also detected | - | - | - | - | - |
+| `ci-wizard-solis` | Nordpool Official | Solis | - | - | - | - | - |
+| `ci-wizard-growatt-vpp` | Nordpool Official | SPH (SolaX Modbus, GEN3, VPP) — experimental, see [platform maturity](memory/project_platform_maturity.md) | 3 | - | - | - | - |
+| `ci-wizard-huawei-luna2000` | Nordpool Official | Huawei LUNA2000 — experimental, see [platform maturity](memory/project_platform_maturity.md) | - | - | - | - | YES |
+
+`ci-wizard-huawei-luna2000` is the only fixture that drives a full backend
+schedule cycle on Huawei. It carries two TOU periods on the battery so the
+#431 readback has something to read, 96 quarterly prices and a solar forecast
+so the DP actually solves. Run it end to end with:
+
+```bash
+SCENARIO=ci-wizard-huawei-luna2000 BESS_SETTINGS=./e2e/ci-bess-settings-huawei.json \
+  BESS_FAKETIME_PRELOAD=/usr/local/lib/libfaketime.so.1 \
+  BESS_FAKETIME="2026-05-21 17:17:48" \
+  podman-compose -f docker-compose.ci.yml up -d
+```
+
+The faketime pin is required: the fixture's prices are keyed to its
+`mock_time` date, so without it the scheduler aborts with "No price data
+available" (see the `verify` skill's gotchas).
+
+**Not in this table — backend-discovery-only, not Playwright-runnable:**
+`ci-wizard-growatt-modbus-gen3.json` was meant to test a GEN3-via-SolaX-Modbus
+"no TOU" path, but GEN3 (`solax_modbus_growatt_sph`) has no TOU path at all —
+`battery_system_manager.py:291-292` documents it as VPP-only. The fixture is
+missing the 5 VPP entities the wizard requires to complete, so "Next" never
+enables and the full flow can't finish. It still gets exercised by
+`test_scenario_discovery.py` (backend-only, doesn't need wizard completion).
+GEN3-via-SolaX-Modbus is itself experimental/unvalidated in the real world —
+only Growatt Cloud SPH and GEN4-via-Modbus are — so this isn't worth forcing
+into a full-completion test by adding fabricated VPP entity IDs.
 
 **What each test validates per scenario:**
-- Correct pricing provider auto-selected (Nordpool vs Octopus)
-- Correct inverter type auto-detected (MIN vs SPH)
+- Correct pricing provider auto-selected (Nordpool vs Octopus vs ENTSO-e)
+- Correct inverter platform auto-selected — the wizard picks the backend's
+  `detectedInverterPlatforms[0]`, so when a scenario has both a Growatt Cloud
+  config entry and SolaX Modbus entities, Cloud wins (it's listed first)
 - Optional integrations shown as found/not-found with correct status
 - Provider-specific fields shown/hidden correctly
-- Can switch between providers when both are available (scenario 7)
+- Can switch between providers/platforms when more than one is available
 - Full wizard completion end-to-end
 
 Scenario expectations are defined in `e2e/tests/wizard-expectations.ts`.
@@ -213,13 +253,56 @@ Name them descriptively: `high_solar_export.json`, `ev_charging_overnight.json`.
 
 Scenarios may carry `expected_results` (plan economics) and `expected_behavior`
 (intent presence/absence, `savings_positive`). When the optimizer legitimately
-changes behavior, regenerate these **from the optimizer** (store `expected_results`
-at ≥4 decimals to avoid 1-dp rounding-boundary flips) rather than hand-editing.
-Optional per-scenario overrides beyond the standard price/consumption/battery
-fields are supported ad hoc as they come up — e.g. `terminal_value_per_kwh`
-(added for #422) lets a fixture pin the DP's terminal-value input directly,
-for bugs whose defect lives in how that input is *computed* upstream (in
-`BatterySystemManager`) rather than in the DP itself.
+changes behavior, regenerate these **from the optimizer** rather than
+hand-editing:
+
+```bash
+.venv/bin/python scripts/capture_scenario_expected_results.py   # prints every delta
+```
+
+It rewrites only the keys a fixture already carries and prints what moved, so
+the PR can quote the measured movement. `--check` reports staleness without
+writing. It is a *deliberate re-pin*, never a way to green a red suite — if you
+cannot explain a printed delta, that delta is the finding.
+
+**`terminal_value_per_kwh` is required on every fixture**, enforced by
+`test_scenarios.py::test_every_fixture_declares_a_terminal_value`. It used to
+be an optional override (added for #422); every other fixture fell through to
+`optimize_battery_schedule`'s `0.0` default, and at 0.0 the DP's terminal-row
+branch never executes, so the whole corpus was blind to terminal value in both
+directions. Generate it with:
+
+```bash
+.venv/bin/python scripts/capture_scenario_terminal_values.py
+```
+
+which applies the production formula (`core/bess/terminal_value.py`) to the
+fixture's own prices, reproducing #422's calendar-day cap scoping as the last
+`24 / period_duration` periods.
+
+**The recorded value is derived, never hand-pinned.** The script overwrites any
+recorded value that disagrees with the formula, and
+`test_scenarios.py::test_recorded_terminal_values_still_match_the_production_formula`
+fails a fixture that carries one — the whole point of the retrofit is that the
+corpus runs at production's terminal value, so a fixture pinned to something
+else is silently exempt from the gate it was added to feed. A defect in how
+`BatterySystemManager` *computes* that input therefore belongs in a test of
+`BatterySystemManager`, not in a scenario fixture.
+
+Adding or changing a fixture therefore means regenerating three artefacts, in
+this order (the second and third fail by design until you do):
+
+```bash
+.venv/bin/python scripts/capture_scenario_terminal_values.py
+.venv/bin/python scripts/capture_selector_goldens.py
+PYTHONPATH=. .venv/bin/python scripts/capture_vpp_baseline.py --add-new
+```
+
+For a change that moves what the DP *plans* on existing fixtures, the VPP step
+is `--repin-current` instead of `--add-new`: it rewrites only the
+`current_plan`/`current` half and prints each fixture's realized-cost delta.
+Never run a full VPP re-baseline to go green — that regenerates both halves and
+destroys the recorded v10.0.2 drift signal.
 
 **For a bug fix that changes optimizer economics or behavior: pin the
 regression into this fixture system before reaching for a standalone test

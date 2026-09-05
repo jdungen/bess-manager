@@ -40,6 +40,9 @@ jobs:
               - 'docker-compose.ci.yml'
               - 'docker-compose.prod-test.yml'
               - 'Dockerfile'
+              - 'backend/Dockerfile'
+              - 'build.json'
+              - 'package-addon.sh'
 
       # Algorithm filter uses a script instead of dorny because dorny's
       # negation patterns don't work correctly with the default 'some'
@@ -112,7 +115,20 @@ jobs:
 
       - name: Run fast tests
         if: needs.changes.outputs.backend == 'true'
-        run: pytest -m "not slow" --tb=short -q
+        run: |
+          pytest -m "not slow" --tb=short -q \
+            --cov=backend --cov=core/bess --cov-report=term-missing \
+            --cov-report=xml
+
+      - name: Coverage summary
+        if: needs.changes.outputs.backend == 'true'
+        run: |
+          {
+            echo "### Coverage (fast tests)"
+            echo '```'
+            python -c "import xml.etree.ElementTree as ET; print(f'Total: {float(ET.parse(\"coverage.xml\").getroot().get(\"line-rate\")) * 100:.1f}%')"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: No backend changes
         if: needs.changes.outputs.backend != 'true'
@@ -196,11 +212,45 @@ jobs:
         if: env.RUN_E2E == 'true'
         run: |
           SCENARIO=ci-normal-day docker compose -f docker-compose.ci.yml up -d
-          timeout 120 bash -c 'until curl -sf http://localhost:8080/api/settings > /dev/null 2>&1; do sleep 2; done'
+          # Gate on an endpoint behind _require_configured_system, NOT on
+          # /api/settings: startup runs in a background thread (app.py
+          # start_in_background) and the first schedule build can take
+          # 10-60+ seconds, while /api/settings answers as soon as uvicorn
+          # binds. /api/dashboard-health-summary is no good either -- it
+          # deliberately returns 200 during startup. Waiting on the wrong
+          # signal let the smoke tests fire before startup_complete and get
+          # 503 "System is starting up" from every guarded endpoint.
+          timeout 180 bash -c 'until curl -sf http://localhost:8080/api/system-health > /dev/null 2>&1; do sleep 2; done'
       - name: "E2E: Run smoke & navigation tests"
         if: env.RUN_E2E == 'true'
         run: cd e2e && npx playwright test --project=chromium
       - name: "E2E: Stop environment"
+        if: always() && env.RUN_E2E == 'true'
+        run: docker compose -f docker-compose.ci.yml down
+
+      # Phase 1b: Growatt VPP schedule build (regression for #399, #469 --
+      # fresh install, VPP remote-control mode, official Nordpool integration).
+      # mock_time is pinned to a fixed past date, so the container's wall
+      # clock must be faked to match or date-anchored price lookups fail.
+      - name: "E2E: Start environment (Growatt VPP)"
+        if: env.RUN_E2E == 'true'
+        run: |
+          BESS_FAKETIME_PRELOAD=/usr/local/lib/libfaketime.so.1 \
+          BESS_FAKETIME="2025-01-15 08:30:00" \
+          SCENARIO=ci-growatt-vpp BESS_SETTINGS=./e2e/ci-bess-settings-growatt-vpp.json \
+          docker compose -f docker-compose.ci.yml up -d
+          timeout 120 bash -c 'until curl -sf http://localhost:8080/api/settings > /dev/null 2>&1; do sleep 2; done'
+      - name: "E2E: Verify Growatt VPP schedule builds without error"
+        if: env.RUN_E2E == 'true'
+        run: |
+          sleep 5
+          curl -sf http://localhost:8080/api/dashboard-health-summary > /dev/null
+          if docker compose -f docker-compose.ci.yml logs bess | grep -q "Failed to update battery schedule"; then
+            echo "Growatt VPP schedule build failed -- see logs below"
+            docker compose -f docker-compose.ci.yml logs bess
+            exit 1
+          fi
+      - name: "E2E: Stop environment (Growatt VPP)"
         if: always() && env.RUN_E2E == 'true'
         run: docker compose -f docker-compose.ci.yml down
 
@@ -272,6 +322,28 @@ jobs:
         if: always() && env.RUN_E2E == 'true'
         run: docker compose -f docker-compose.ci.yml down
 
+      - name: "E2E: Wizard — SolaX with disabled lifetime counters (#549)"
+        if: always() && env.RUN_E2E == 'true'
+        run: |
+          echo '{}' > ./e2e/ci-wizard-settings.json
+          SCENARIO=ci-wizard-solax-disabled-lifetime BESS_SETTINGS=./e2e/ci-wizard-settings.json BESS_OPTIONS=./e2e/ci-wizard-options.json docker compose -f docker-compose.ci.yml up -d
+          timeout 120 bash -c 'until curl -sf http://localhost:8080/api/setup/status > /dev/null 2>&1; do sleep 2; done'
+          cd e2e && SCENARIO=ci-wizard-solax-disabled-lifetime npx playwright test --project=wizard
+      - name: "E2E: Stop wizard (disabled lifetime counters)"
+        if: always() && env.RUN_E2E == 'true'
+        run: docker compose -f docker-compose.ci.yml down
+
+      - name: "E2E: Wizard — no price provider installed (#549)"
+        if: always() && env.RUN_E2E == 'true'
+        run: |
+          echo '{}' > ./e2e/ci-wizard-settings.json
+          SCENARIO=ci-wizard-no-price-provider BESS_SETTINGS=./e2e/ci-wizard-settings.json BESS_OPTIONS=./e2e/ci-wizard-options-no-pricing.json docker compose -f docker-compose.ci.yml up -d
+          timeout 120 bash -c 'until curl -sf http://localhost:8080/api/setup/status > /dev/null 2>&1; do sleep 2; done'
+          cd e2e && SCENARIO=ci-wizard-no-price-provider npx playwright test --project=wizard
+      - name: "E2E: Stop wizard (no price provider)"
+        if: always() && env.RUN_E2E == 'true'
+        run: docker compose -f docker-compose.ci.yml down
+
       - name: "E2E: Wizard — Full integrations"
         if: always() && env.RUN_E2E == 'true'
         run: |
@@ -338,6 +410,28 @@ jobs:
         if: always() && env.RUN_E2E == 'true'
         run: docker compose -f docker-compose.ci.yml down
 
+      - name: "E2E: Wizard — Growatt VPP (real config, ridax67 / #118)"
+        if: always() && env.RUN_E2E == 'true'
+        run: |
+          echo '{}' > ./e2e/ci-wizard-settings.json
+          SCENARIO=ci-wizard-growatt-vpp-ridax-118 BESS_SETTINGS=./e2e/ci-wizard-settings.json BESS_OPTIONS=./e2e/ci-wizard-options.json docker compose -f docker-compose.ci.yml up -d
+          timeout 120 bash -c 'until curl -sf http://localhost:8080/api/setup/status > /dev/null 2>&1; do sleep 2; done'
+          cd e2e && SCENARIO=ci-wizard-growatt-vpp-ridax-118 npx playwright test --project=wizard
+      - name: "E2E: Stop wizard (Growatt VPP real config)"
+        if: always() && env.RUN_E2E == 'true'
+        run: docker compose -f docker-compose.ci.yml down
+
+      - name: "E2E: Wizard — Growatt MIN (GEN4 + SolaX Modbus)"
+        if: always() && env.RUN_E2E == 'true'
+        run: |
+          echo '{}' > ./e2e/ci-wizard-settings.json
+          SCENARIO=ci-wizard-growatt-modbus BESS_SETTINGS=./e2e/ci-wizard-settings.json BESS_OPTIONS=./e2e/ci-wizard-options.json docker compose -f docker-compose.ci.yml up -d
+          timeout 120 bash -c 'until curl -sf http://localhost:8080/api/setup/status > /dev/null 2>&1; do sleep 2; done'
+          cd e2e && SCENARIO=ci-wizard-growatt-modbus npx playwright test --project=wizard
+      - name: "E2E: Stop wizard (Growatt MIN Modbus)"
+        if: always() && env.RUN_E2E == 'true'
+        run: docker compose -f docker-compose.ci.yml down
+
       - uses: actions/upload-artifact@v4
         if: failure() && env.RUN_E2E == 'true'
         with:
@@ -349,21 +443,57 @@ jobs:
     name: Code quality
     runs-on: ubuntu-latest
     steps:
+      # Full history: the mypy step below needs a real merge-base against
+      # main, which a shallow clone cannot produce.
       - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
 
       - uses: actions/setup-python@v5
         with:
           python-version: "3.13"
           cache: pip
 
+      # The same two files every other Python job installs, not a hand-picked
+      # subset: mypy resolves imports from the environment, and with
+      # --ignore-missing-imports anything absent silently becomes Any. That
+      # cuts both ways. Missing `pytest` makes every `@pytest.fixture` and
+      # `@pytest.mark.parametrize` untyped, so an annotated test reports
+      # `untyped-decorator` here while type-checking clean in the local .venv
+      # -- and no amount of annotating closes it. Missing `fastapi` does the
+      # same to `@router.get`. Missing `numpy` goes the other way and MASKS
+      # real errors: pwl_window_dp.py reports 7 errors with numpy installed
+      # and 3 without, so a genuine mistake would pass the merge gate and
+      # fail only on the maintainer's machine.
       - name: Install tools
-        run: pip install black ruff
+        run: |
+          pip install -r backend/requirements.txt
+          pip install -r requirements-dev.txt
 
       - name: Black formatting
         run: black --check . --exclude="/(build|\.venv|node_modules)/"
 
       - name: Ruff linting
         run: ruff check . --exclude="build,.venv,node_modules"
+
+      # Scoped exactly like scripts/quality-check.sh: code you touch must
+      # type-check, and the legacy backlog burns down as files get edited.
+      # Repo-wide is not an option (2914 errors across 191 files).
+      #
+      # This job aggregates into the Merge gate, which is the single required
+      # status check on main. Enforcing mypy only in quality-check.sh would
+      # leave it unenforced on exactly the path that gates merges — a
+      # violation could still reach main through any ordinary PR, which is
+      # the gap this whole change exists to close.
+      - name: mypy on changed files
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin main
+          # Same script quality-check.sh runs, so a green local gate and a
+          # green CI gate mean the same thing. Without --include-worktree:
+          # CI has only the commit, and an untracked-file scan here would
+          # pick up build artefacts rather than authored code.
+          scripts/mypy-changed.sh mypy
 
   # ── Docker build & boot: verify production image starts ──────────
   docker-build-test:
@@ -400,6 +530,26 @@ jobs:
       - name: Stop environment
         if: always()
         run: docker compose -f docker-compose.prod-test.yml down
+
+      # The step above builds ./Dockerfile — what release-addon.yml publishes
+      # to GHCR. A local install goes down a different path entirely:
+      # deploy.sh → package-addon.sh, which ships backend/Dockerfile and lets
+      # the supervisor build it against build.json. That path had no CI
+      # coverage, which is how a base image with Python 3.11 and a numpy pin
+      # needing >=3.12 reached users. Build it here the way the supervisor
+      # does, using the real base from build.json.
+      - name: Build the add-on image the supervisor builds
+        run: |
+          ./package-addon.sh
+          BASE=$(jq -r '.build_from.amd64' build.json)
+          echo "Building build/bess_manager/Dockerfile on $BASE"
+          docker build \
+            --build-arg BUILD_FROM="$BASE" \
+            --build-arg BUILD_VERSION=ci \
+            -t bess-addon-supervisor-test \
+            build/bess_manager
+          docker run --rm --entrypoint /app/venv/bin/python bess-addon-supervisor-test \
+            -c "import sys, numpy, pandas, fastapi; print('py', sys.version.split()[0], 'numpy', numpy.__version__)"
 
   # ── Merge gate: single required check for branch protection ──────
   # Branch protection cannot require the conditional jobs (test-algorithm,

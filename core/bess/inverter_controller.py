@@ -6,9 +6,11 @@ implement hardware-specific schedule conversion and deployment.
 
 import logging
 from abc import ABC, abstractmethod
+from collections.abc import Mapping
 from typing import ClassVar
 
 from .dp_schedule import DPSchedule
+from .execution_model import INTENT_TO_MODE, command_index
 from .settings import BatterySettings
 
 logger = logging.getLogger(__name__)
@@ -57,14 +59,13 @@ class InverterController(ABC):
     }
 
     # Map strategic intents to battery modes (shared across Growatt MIN and SPH).
-    INTENT_TO_MODE: ClassVar[dict[str, str]] = {
-        "GRID_CHARGING": "battery_first",
-        "SOLAR_STORAGE": "load_first",
-        "LOAD_SUPPORT": "load_first",
-        "BATTERY_EXPORT": "grid_first",
-        "SOLAR_EXPORT": "load_first",
-        "IDLE": "load_first",
-    }
+    # Defined in `execution_model` -- the same vocabulary the optimizer scores
+    # commands against (Phase 4a, D1) -- and referenced here so the controllers
+    # and the execution model cannot drift apart.
+    # Typed `Mapping`, not `dict`: the object is a read-only view (see
+    # execution_model), so a `dict` annotation would type-check an in-place
+    # write that fails at runtime.
+    INTENT_TO_MODE: ClassVar[Mapping[str, str]] = INTENT_TO_MODE
 
     # Human-readable descriptions of strategic intents.
     INTENT_DESCRIPTIONS: ClassVar[dict[str, str]] = {
@@ -83,6 +84,12 @@ class InverterController(ABC):
     # read and write.  False on platforms that bake power % into atomic
     # TOU schedule writes (SPH, SolaX native).
     supports_charge_rate_control: ClassVar[bool] = True
+
+    # Whether the platform can curtail PV export via a hardware export-limit
+    # register (issue #269), requiring a grid CT/smart meter. False by
+    # default -- most platforms' HA integrations don't expose this control
+    # at all (e.g. growatt_server exposes no export-limit service/entity).
+    supports_export_limit_control: ClassVar[bool] = False
 
     # ── SM-Period-lists scheduling model ────────────────────────────────────
     # Subclasses that build separate charge/discharge period lists (Growatt
@@ -109,6 +116,22 @@ class InverterController(ABC):
     # full-power discharge instead of gently covering a dip (#324).
     discharge_rate_is_load_following: ClassVar[bool] = True
 
+    # Whether a planned LOAD_SUPPORT discharge is delivered as
+    # min(plan, actual load). Related to the flag above but NOT the same
+    # question, and the answers differ on solax_modbus VPP mode: there the
+    # rate register is a forced power (flag above False), yet LOAD_SUPPORT
+    # writes no rate at all -- #413 disables remote control for that intent
+    # and lets the inverter's own load-following self-use run the period, so
+    # a cover plan is delivered exactly (this flag True). True by default
+    # (TOU-register control, where the rate is a ceiling); False on native
+    # SolaX, which never received #413, and on the period-list platforms,
+    # which have no per-period control to deliver a partial cover with.
+    # Read by the optimizer through
+    # execution_model.PlatformCapabilities.load_support_delivers_exact_cover
+    # to decide whether the off-lattice exact-cover candidate (#466) is
+    # executable here (#580).
+    load_support_delivers_exact_cover: ClassVar[bool] = True
+
     # Whether the default _write_period_to_hardware() should skip re-sending
     # a register (grid_charge/discharge_rate) that already matches the last
     # value it successfully wrote (#402: unguarded resends from the 15-min
@@ -121,6 +144,18 @@ class InverterController(ABC):
     # silently re-gated by this unrelated change.
     dedupe_register_writes: ClassVar[bool] = True
 
+    # Real hardware control model this platform uses, driving what fields
+    # get_period_settings()/get_detailed_period_groups()/get_all_tou_segments()
+    # attach to each period (see _mode_display_fields()):
+    # - "tou_register": genuine load_first/battery_first/grid_first hardware
+    #   register exists (Growatt MIN, solax_modbus Growatt in TOU mode).
+    # - "vpp_power": no mode register; behavior is (power_pct,
+    #   remote_control) per period (solax_modbus Growatt VPP mode, native
+    #   SolaX).
+    # - "period_list": no per-period mode or power value; behavior is
+    #   discrete charge/discharge time slots (Growatt SPH, Solis, Huawei).
+    CONTROL_MODEL: ClassVar[str] = "tou_register"
+
     def discharge_resolution_kw(self, max_discharge_power_kw: float) -> float:
         """Smallest controllable discharge increment this platform can
         execute, in kW. Default: Growatt's integer-percent-of-max grid (1%
@@ -128,15 +163,6 @@ class InverterController(ABC):
         (core/bess/simulation/inverter_simulator.py::_map_rates, postmortem
         #282). Override on a platform whose hardware resolution differs."""
         return max_discharge_power_kw / 100
-
-    @property
-    def self_throttle_export_threshold_kwh(self) -> float:
-        """Discharge overshoot (kWh) below which this platform silently
-        delivers only what the home needs rather than exporting the excess
-        (Growatt MIN's `load_first` behavior, #240). Default: 0.01 kWh.
-        Override on a platform with no such self-throttle (e.g. one that
-        always writes an exact watt target)."""
-        return 0.01
 
     def __init__(self, battery_settings: BatterySettings) -> None:
         """Initialize shared inverter controller state."""
@@ -355,7 +381,6 @@ class InverterController(ABC):
                 {
                     "start_time": p["start_time"],
                     "end_time": p["end_time"],
-                    "batt_mode": "battery_first",
                     "enabled": p.get("enabled", True),
                     "is_default": is_default,
                     "strategic_intent": charge_intent,
@@ -366,7 +391,6 @@ class InverterController(ABC):
                 {
                     "start_time": p["start_time"],
                     "end_time": p["end_time"],
-                    "batt_mode": "grid_first",
                     "enabled": p.get("enabled", True),
                     "is_default": is_default,
                     "strategic_intent": discharge_intent,
@@ -457,10 +481,11 @@ class InverterController(ABC):
         block_passive_charging = self.INTENT_TO_CONTROL[intent]["charge_rate"] == 0
         return grid_charge, discharge_rate, block_passive_charging
 
-    @staticmethod
-    def _scale_to_percent(power_kw: float, max_power_kw: float) -> int:
-        """Scale a power value to a 0-100 percent rate, clamped to range."""
-        return min(100, max(0, round(power_kw / max_power_kw * 100)))
+    # `_scale_to_percent` lived here and did this conversion by nearest
+    # rounding for both rate paths. Both now go through
+    # `execution_model.command_index`, which rounds by what the written
+    # number means -- discharge in 4b, charge in 4c -- so it has no callers
+    # left and is gone rather than kept as a second way to do the same thing.
 
     def _compute_charge_rate(
         self, intent: str, control: dict[str, bool | int], battery_action_kw: float
@@ -476,7 +501,23 @@ class InverterController(ABC):
             Charge rate percent (0-100)
         """
         if intent == "GRID_CHARGING" and battery_action_kw > 0.01:
-            return self._scale_to_percent(battery_action_kw, self.max_charge_power_kw)
+            # Rounded UP, like a discharge ceiling and for the same reason
+            # (Phase 4c): the battery's own remaining room binds above the
+            # command -- the inverter stops when full -- so a rate above the
+            # plan delivers the plan exactly, while nearest-rounding lands
+            # below it and silently charges less. Measured pre-fix: 4 of 493
+            # charging periods short, worst -0.0288 kWh.
+            #
+            # Safe because the DP floors a plan the *import cap* limited
+            # (`lattice_grid_charge`), which is the one case where nothing
+            # physical binds above the command and rounding up would draw
+            # more from the grid than the house fuse allows. With that plan
+            # already on the lattice, rounding up is a no-op there.
+            return command_index(
+                battery_action_kw,
+                self.max_charge_power_kw / 100,
+                rate_is_ceiling=True,
+            )
         return control["charge_rate"]
 
     def _effective_grid_charge(self, intent: str, grid_charge: bool) -> bool:
@@ -545,8 +586,28 @@ class InverterController(ABC):
             return self._effective_grid_charge(intent, False), 0
         elif intent in ("LOAD_SUPPORT", "BATTERY_EXPORT"):
             if battery_action_kw < -0.01:
-                discharge_rate = self._scale_to_percent(
-                    abs(battery_action_kw), self.max_discharge_power_kw
+                discharge_rate = command_index(
+                    abs(battery_action_kw),
+                    # The platform's own lattice, not a hardcoded 1%: the
+                    # planner enumerates candidates on
+                    # `discharge_resolution_kw` (via
+                    # `PlatformCapabilities.discharge_rate_step_kw`), so a
+                    # platform that overrides it and a write path that did
+                    # not would plan on one grid and command on another --
+                    # R != P by construction. No shipped controller
+                    # overrides it today, which is exactly why this was
+                    # invisible.
+                    self.discharge_resolution_kw(self.max_discharge_power_kw),
+                    # LOAD_SUPPORT writes load_first, where the number is a
+                    # ceiling on hardware that load-follows -- so it must be
+                    # rounded UP or it under-delivers the plan (Phase 4b;
+                    # see command_index). BATTERY_EXPORT writes
+                    # grid_first, where the number is the delivered power on
+                    # every platform, so nearest stays correct.
+                    rate_is_ceiling=(
+                        intent == "LOAD_SUPPORT"
+                        and self.discharge_rate_is_load_following
+                    ),
                 )
             else:
                 discharge_rate = 0
@@ -565,6 +626,7 @@ class InverterController(ABC):
         discharge_rate: int,
         block_passive_charging: bool = False,
         strategic_intent: str = "",
+        at_reserve_floor: bool = False,
     ) -> tuple[bool, str]:
         """Write period control settings to hardware.
 
@@ -586,6 +648,12 @@ class InverterController(ABC):
                 BATTERY_EXPORT to the same values, so platforms that need to
                 treat them differently (VPP-style -- see #413) require the
                 intent itself. Register-based platforms ignore this.
+            at_reserve_floor: Whether the battery is at (or below) its
+                configured minimum SoE right now. Register-based platforms
+                ignore this -- their min_soc register already stops discharge
+                at the floor. Forced-power platforms use it to stop holding a
+                battery that has nothing left to hold, releasing the inverter
+                so its BMS can sleep -- see #592.
 
         Returns:
             Tuple of (success, error_message). error_message is empty on success.
@@ -593,6 +661,20 @@ class InverterController(ABC):
         return self._write_period_to_hardware(
             controller, grid_charge, discharge_rate, block_passive_charging
         )
+
+    def apply_export_limit(self, controller, curtail: bool) -> None:  # noqa: B027
+        """Enable/disable PV export curtailment for this period (issue #269).
+
+        No-op by default -- only platforms with supports_export_limit_control
+        True override this. Callers should check the capability flag before
+        relying on this doing anything; the no-op exists so BSM can call it
+        unconditionally without a per-platform branch.
+
+        Args:
+            controller: HomeAssistantAPIController instance
+            curtail: True to curtail export (write 0%/Meter mode), False to
+                release it back to normal (Disabled).
+        """
 
     def get_period_settings(self, period: int) -> dict:
         """Get control settings for a specific 15-minute period.
@@ -612,7 +694,6 @@ class InverterController(ABC):
             )
 
         intent = self.strategic_intents[period]
-        mode = self._effective_mode_for_intent(intent, self.INTENT_TO_MODE[intent])
 
         if (
             self.current_schedule is not None
@@ -623,7 +704,7 @@ class InverterController(ABC):
             num_periods = len(self.current_schedule.actions)
             period_duration_hours = 24.0 / num_periods
             battery_action_kw = battery_action_kwh / period_duration_hours
-            grid_charge, discharge_rate, _block_passive_charging = (
+            grid_charge, discharge_rate, block_passive_charging = (
                 self.compute_rates_for_period(period, battery_action_kw)
             )
             charge_rate = self._compute_charge_rate(
@@ -631,17 +712,122 @@ class InverterController(ABC):
             )
         else:
             control = self.INTENT_TO_CONTROL[intent]
-            grid_charge = self._effective_grid_charge(intent, control["grid_charge"])
+            grid_charge = self._effective_grid_charge(
+                intent, bool(control["grid_charge"])
+            )
             charge_rate = control["charge_rate"]
             discharge_rate = control["discharge_rate"]
+            block_passive_charging = control["charge_rate"] == 0
 
         return {
             "grid_charge": grid_charge,
             "charge_rate": charge_rate,
             "discharge_rate": discharge_rate,
             "strategic_intent": intent,
-            "batt_mode": mode,
+            **self._mode_display_fields(
+                intent,
+                grid_charge,
+                discharge_rate,
+                block_passive_charging,
+                self._planned_at_reserve_floor(period),
+            ),
         }
+
+    def _planned_at_reserve_floor(self, period: int) -> bool:
+        """Whether the *plan* has the battery on its reserve floor entering
+        this period (#592).
+
+        The display counterpart to `BatterySystemManager._at_reserve_floor()`,
+        which reads live SoC. A displayed period is a prediction, so the plan's
+        own SoE trajectory is the correct input -- but it must answer the same
+        question, or the UI shows a hold for periods production releases and
+        `_mode_display_fields` breaks its own no-fabrication contract.
+
+        **Index p-1, not p.** `state_of_energy` is `combined_soe`, whose only
+        writer stores `period_data.energy.battery_soe_end` (see
+        `BatterySystemManager._create_updated_schedule`) -- `battery_soe_end`
+        and `battery_soe_start` are distinct fields on `EnergyData`. So
+        `state_of_energy[p]` is the SoE *leaving* period p, and the SoE
+        *entering* it is index p-1. Reading index p directly would answer for
+        the wrong period: at the boundary where the plan first reaches the
+        floor it would report "at floor" one period early, and one period late
+        on the way back up -- exactly the display/write disagreement this
+        method exists to prevent.
+
+        Period 0 has no predecessor in the array, so it reads index 0. That is
+        exact only when period 0 *is* the optimization period, where
+        `combined_soe[0]` is written as `current_soe` — an entering value. On a
+        schedule re-optimized mid-day, index 0 is a historical period holding
+        `battery_soe_end` like every other index, so the read is one period
+        early there. Display-only and bounded to period 0: `get_period_settings`
+        never writes hardware, and the live write path reads SoC directly. Left
+        as-is rather than papered over, because the array has no entering value
+        for period 0 to read — recording one is a change to
+        `_create_updated_schedule`, not to this method.
+
+        False when there is no plan to read: with no trajectory there is no
+        prediction to display, and the hold is the unchanged-behaviour answer.
+        """
+        if self.current_schedule is None:
+            return False
+        soe = self.current_schedule.state_of_energy
+        if period >= len(soe):
+            return False
+        entering_soe = soe[period - 1] if period > 0 else soe[0]
+        return entering_soe <= self.battery_settings.min_soe_kwh
+
+    def _mode_display_fields(
+        self,
+        intent: str,
+        grid_charge: bool,
+        discharge_rate: int,
+        block_passive_charging: bool,
+        at_reserve_floor: bool = False,
+    ) -> dict:
+        """Single source of truth for what mode-related fields a period
+        gets, branching on CONTROL_MODEL. Never fabricates a label the
+        hardware doesn't back — see design spec
+        docs/superpowers/specs/2026-07-29-control-model-display-design.md.
+
+        vpp_power controllers each keep their own power-computation method
+        (SolaxModbusGrowattController._intent_to_vpp,
+        SolaxController._vpp_display_state) rather than sharing one --
+        their real hardware behavior has diverged (design spec section 1
+        correction).
+
+        Returns:
+            {"batt_mode": str} for tou_register.
+            {"vpp_power_pct": int, "vpp_remote_control": bool} for vpp_power.
+            {} for period_list.
+        """
+        if self.CONTROL_MODEL == "tou_register":
+            return {
+                "batt_mode": self._effective_mode_for_intent(
+                    intent, self.INTENT_TO_MODE[intent]
+                )
+            }
+
+        if self.CONTROL_MODEL == "vpp_power":
+            # Every vpp_power controller must implement _vpp_display_state()
+            # with this unified signature (SolaxController,
+            # SolaxModbusGrowattController) -- no hasattr() duck-typing on a
+            # subclass-private method name.
+            power_pct, remote_control = self._vpp_display_state(
+                grid_charge,
+                discharge_rate,
+                block_passive_charging,
+                intent,
+                at_reserve_floor,
+            )
+            return {
+                "vpp_power_pct": power_pct,
+                "vpp_remote_control": remote_control,
+            }
+
+        if self.CONTROL_MODEL == "period_list":
+            return {}
+
+        raise ValueError(f"Unknown CONTROL_MODEL: {self.CONTROL_MODEL!r}")
 
     def get_strategic_intent_summary(self) -> dict:
         """Get a summary of strategic intents for the day (aggregated from quarterly periods)."""
@@ -685,11 +871,13 @@ class InverterController(ABC):
         intents: list[str] | None = None,
         actions: list[float] | None = None,
         soc_values: list[float | None] | None = None,
+        curtailed: list[bool] | None = None,
     ) -> list[dict]:
         """Get period groups with full control parameters for display/API.
 
         Groups consecutive 15-minute periods ONLY when ALL parameters are identical:
-        strategic intent, battery mode, grid charge, charge rate, and discharge rate.
+        strategic intent, battery mode, grid charge, charge rate, discharge
+        rate, and planned curtailment (#501).
 
         Args:
             intents: Optional list of strategic intents to group. If None,
@@ -699,6 +887,10 @@ class InverterController(ABC):
                      is also None or the period is out of range, action defaults to 0.0.
             soc_values: Optional per-period SOC end values (%). The last period's value
                         in each group is exposed as soc_end_pct in the result.
+            curtailed: Optional per-period planned-curtailment flags (#501),
+                       from PeriodData.decision.curtailed. Defaults to all
+                       False when omitted -- callers without curtailment
+                       data get the pre-#501 grouping behavior unchanged.
 
         Returns:
             List of period groups with all control parameters and time strings
@@ -718,12 +910,14 @@ class InverterController(ABC):
         period_settings = []
         for period in range(num_periods):
             intent = effective_intents[period]
-            mode = self._effective_mode_for_intent(
-                intent, self.INTENT_TO_MODE.get(intent, "load_first")
-            )
             control = self.INTENT_TO_CONTROL.get(
                 intent,
                 {"grid_charge": False, "charge_rate": 100, "discharge_rate": 0},
+            )
+            period_curtailed = (
+                curtailed[period]
+                if curtailed is not None and period < len(curtailed)
+                else False
             )
 
             action_kwh = 0.0
@@ -733,31 +927,42 @@ class InverterController(ABC):
 
             _, discharge_rate = self._map_intent_to_rates(intent, action_kw)
             charge_rate = self._compute_charge_rate(intent, control, action_kw)
+            block_passive_charging = control["charge_rate"] == 0
+            mode_fields = self._mode_display_fields(
+                intent,
+                self._effective_grid_charge(intent, bool(control["grid_charge"])),
+                discharge_rate,
+                block_passive_charging,
+            )
 
             period_settings.append(
                 {
                     "period": period,
                     "intent": intent,
-                    "mode": mode,
+                    **mode_fields,
                     "grid_charge": self._effective_grid_charge(
-                        intent, control["grid_charge"]
+                        intent, bool(control["grid_charge"])
                     ),
                     "charge_rate": charge_rate,
                     "discharge_rate": discharge_rate,
                     "action_kwh": action_kwh,
+                    "curtailed": period_curtailed,
                 }
             )
 
         groups = []
         current_group: dict | None = None
 
+        mode_field_keys = ("batt_mode", "vpp_power_pct", "vpp_remote_control")
+
         for ps in period_settings:
             if current_group is not None and (
                 ps["intent"] == current_group["intent"]
-                and ps["mode"] == current_group["mode"]
+                and all(ps.get(k) == current_group.get(k) for k in mode_field_keys)
                 and ps["grid_charge"] == current_group["grid_charge"]
                 and ps["charge_rate"] == current_group["charge_rate"]
                 and ps["discharge_rate"] == current_group["discharge_rate"]
+                and ps["curtailed"] == current_group["curtailed"]
             ):
                 current_group["end_period"] = ps["period"]
                 current_group["count"] += 1
@@ -769,10 +974,11 @@ class InverterController(ABC):
                     "start_period": ps["period"],
                     "end_period": ps["period"],
                     "intent": ps["intent"],
-                    "mode": ps["mode"],
+                    **{k: ps[k] for k in mode_field_keys if k in ps},
                     "grid_charge": ps["grid_charge"],
                     "charge_rate": ps["charge_rate"],
                     "discharge_rate": ps["discharge_rate"],
+                    "curtailed": ps["curtailed"],
                     "count": 1,
                     "total_action_kwh": ps["action_kwh"],
                 }
@@ -799,7 +1005,7 @@ class InverterController(ABC):
                     "start_period": group["start_period"],
                     "end_period": group["end_period"],
                     "intent": group["intent"],
-                    "mode": group["mode"],
+                    **{k: group[k] for k in mode_field_keys if k in group},
                     "grid_charge": group["grid_charge"],
                     "charge_rate": group["charge_rate"],
                     "discharge_rate": group["discharge_rate"],
@@ -807,6 +1013,7 @@ class InverterController(ABC):
                     "duration_minutes": group["count"] * 15,
                     "total_action_kwh": group["total_action_kwh"],
                     "soc_end_pct": soc_end,
+                    "curtailed": group["curtailed"],
                 }
             )
         return result
@@ -833,13 +1040,16 @@ class InverterController(ABC):
         """
 
     @abstractmethod
-    def write_to_hardware(
+    def sync_to_hardware(
         self,
         controller,
         effective_period: int,
-        current_tou: list,
     ) -> tuple[int, int]:
         """Write schedule to inverter hardware.
+
+        Implementations that need to know what the inverter currently holds
+        must read it from the inverter themselves — there is no caller-supplied
+        snapshot, because one that drifted out of sync caused issue #551.
 
         Returns:
             Tuple of (writes, disables)
@@ -857,6 +1067,19 @@ class InverterController(ABC):
         as an accepted diagnostic side effect on platforms that support it.
         """
 
+    def reconcile_hardware(self, controller, effective_period: int) -> tuple[int, int]:
+        """Re-assert the committed plan on a cycle that changed nothing.
+
+        Default: do nothing. A platform that rewrites its whole control state
+        whenever it runs cannot drift undetected — the next cycle overwrites
+        whatever it finds. Only a platform that *skips* the write while its
+        plan holds steady has a window in which the inverter can lose a
+        segment, or restore one, without anybody looking.
+
+        Returns (writes, disables).
+        """
+        return 0, 0
+
     @abstractmethod
     def read_and_initialize_from_hardware(self, controller, current_hour: int) -> None:
         """Read current schedule from inverter and initialize this controller."""
@@ -872,6 +1095,16 @@ class InverterController(ABC):
         override to perform whatever one-time writes their hardware requires.
         The default is a no-op so controllers with no startup writes need not
         override it.
+        """
+
+    def leave_control_mode(self, controller) -> None:  # noqa: B027
+        """Clean up hardware state before this controller instance is replaced
+        by a control_mode switch (e.g. vpp -> tou).
+
+        Called on the outgoing controller by BatterySystemManager.switch_control_mode()
+        before the new mode's controller is created. The default is a no-op;
+        override for hardware whose mode leaves a persistent override active
+        that the next mode won't otherwise clear (see #479).
         """
 
     def _write_period_to_hardware(

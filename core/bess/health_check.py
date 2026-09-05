@@ -30,6 +30,64 @@ def describe_failing_checks(component: dict) -> str:
     return "; ".join(parts)
 
 
+def resolve_component_device(
+    component: dict, entity_to_device: dict, device_names: dict
+) -> str:
+    """Resolve the underlying device a health component reports about.
+
+    Failing sub-checks resolve first (mirroring ``describe_failing_checks``'s
+    ``status not in ("OK", None)`` filter): a component's checks span several
+    underlying devices — e.g. Energy Monitoring reads smart-meter, PV-inverter
+    and battery sensors — so a healthy first entry must not win over a failing
+    one. If no failing sub-check carries a resolvable ``entity_id``, fall back
+    to any resolvable sub-check; if none resolves (the component is not
+    sensor-backed, or the registry maps are unavailable), fall back to the
+    component's own name — unresolvable components group under that name,
+    which is a data limit rather than a workaround.
+    """
+    checks = component.get("checks", [])
+    failing = [check for check in checks if check.get("status") not in ("OK", None)]
+    for check in failing:
+        entity_id = check.get("entity_id")
+        if entity_id and entity_id != "Not mapped":
+            device_id = entity_to_device.get(entity_id)
+            if device_id:
+                return str(device_names.get(device_id, device_id))
+    for check in checks:
+        entity_id = check.get("entity_id")
+        if entity_id and entity_id != "Not mapped":
+            device_id = entity_to_device.get(entity_id)
+            if device_id:
+                return str(device_names.get(device_id, device_id))
+    return str(component["name"])
+
+
+def group_components_by_device(
+    components: list[dict],
+    entity_to_device: dict | None = None,
+    device_names: dict | None = None,
+) -> list[dict]:
+    """Bucket health components by the underlying device they report about.
+
+    Returns one dict per distinct device: ``device`` (the label), ordered
+    ``component_names``, and each member's ``statuses``. Collapses the
+    per-component banner spam from a single-device outage into one line per
+    device; ``None`` registry maps are treated as empty so the helpers stay
+    usable when the registry is unreachable.
+    """
+    entity_to_device = entity_to_device or {}
+    device_names = device_names or {}
+    groups: dict[str, dict] = {}
+    for component in components:
+        device = resolve_component_device(component, entity_to_device, device_names)
+        group = groups.setdefault(
+            device, {"device": device, "component_names": [], "statuses": []}
+        )
+        group["component_names"].append(component["name"])
+        group["statuses"].append(component.get("status"))
+    return list(groups.values())
+
+
 def format_sensor_value_with_unit(value, method_name: str, controller) -> str:
     """Format sensor value with appropriate unit based on METHOD_SENSOR_MAP.
 
@@ -97,11 +155,17 @@ def determine_health_status(
     optional_total = 0
 
     for check_result in health_check_results:
-        # Intentionally unconfigured sensors don't count toward health
-        if check_result.get("status") == "SKIPPED":
+        method_name = check_result.get("method_name", "unknown")
+
+        # Intentionally unconfigured sensors don't count toward health —
+        # unless they're required, in which case being unmapped is itself
+        # the failure and must count against required_total.
+        if (
+            check_result.get("status") == "SKIPPED"
+            and method_name not in required_methods
+        ):
             continue
 
-        method_name = check_result.get("method_name", "unknown")
         # A sensor is working if it has status "OK" after method call testing
         is_working = check_result.get("status") == "OK"
 
@@ -135,6 +199,8 @@ def perform_health_check(
     is_required: bool,
     controller,
     all_methods: list[str],
+    required_methods: list[str] | None = None,
+    empty_list_is_ok: set[str] | None = None,
 ) -> dict:
     """Generic health check function that can be used by any component.
 
@@ -150,11 +216,32 @@ def perform_health_check(
             optional components show WARNING.
         controller: The controller instance with validate_methods_sensors method
         all_methods: List of all method names this component uses
+        required_methods: Subset of ``all_methods`` that is required, for
+            components where only some methods are load-bearing. Only
+            meaningful with ``is_required=True``; defaults to all of them.
+            Energy Prediction uses this: under the ``sensor`` consumption
+            strategy the consumption sensor is mandatory while the solar
+            forecast stays genuinely optional (#558).
 
     Returns:
         Health check result dictionary
     """
-    required_methods = all_methods if is_required else []
+    if is_required:
+        required_methods = (
+            all_methods if required_methods is None else list(required_methods)
+        )
+        # A required method that is not also checked is never returned by
+        # validate_methods_sensors, so required_total stays 0 and the
+        # "specified but none configured" branch below reports ERROR for
+        # something that was never looked at.
+        unchecked = set(required_methods) - set(all_methods)
+        if unchecked:
+            raise ValueError(
+                f"required_methods {sorted(unchecked)} are not in all_methods "
+                f"for component '{component_name}'"
+            )
+    else:
+        required_methods = []
     health_check = {
         "name": component_name,
         "description": description,
@@ -180,7 +267,11 @@ def perform_health_check(
             "error": None,
         }
 
-        if method_info["status"] == "not_configured":
+        method_name = method_info.get("method_name")
+        if (
+            method_info["status"] == "not_configured"
+            and method_name not in required_methods
+        ):
             # Sensor intentionally not configured by user — skip silently
             check_result.update(
                 {
@@ -192,7 +283,12 @@ def perform_health_check(
             health_check["checks"].append(check_result)
             continue
 
-        if method_info["status"] == "ok":
+        if method_info["status"] == "ok" or method_info["status"] == "not_configured":
+            # A required method whose primary sensor mapping is missing may
+            # still succeed: some methods (e.g. get_load_consumption_lifetime)
+            # derive their value from other sensors when the direct one isn't
+            # configured, so the pre-check's "not_configured" verdict on the
+            # primary sensor doesn't necessarily mean the method itself fails.
             # Test the actual method
             try:
                 method = getattr(controller, method_info["method_name"])
@@ -202,12 +298,23 @@ def perform_health_check(
                 if isinstance(value, list):
                     # Handle list values (like predictions)
                     if len(value) == 0:
+                        # For most list sensors an empty reading means the
+                        # source produced nothing and something is wrong. For
+                        # a few it is the normal answer — the consumption
+                        # overlay declares nothing on an ordinary day — so
+                        # those are named by the caller rather than warned on.
+                        empty_is_fine = (
+                            empty_list_is_ok is not None
+                            and method_name in empty_list_is_ok
+                        )
                         check_result.update(
                             {
-                                "status": "WARNING",
-                                "error": "Empty list returned",
+                                "status": "OK" if empty_is_fine else "WARNING",
+                                "error": None if empty_is_fine else "Empty list",
                                 "rawValue": value,
-                                "displayValue": "Empty list",
+                                "displayValue": (
+                                    "None declared" if empty_is_fine else "Empty list"
+                                ),
                             }
                         )
                     else:

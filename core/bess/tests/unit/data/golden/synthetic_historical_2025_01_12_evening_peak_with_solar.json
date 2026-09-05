@@ -1,0 +1,28 @@
+{
+ "actions": [
+  0.0,
+  0.0,
+  -1.035,
+  -1.5
+ ],
+ "intents": [
+  "IDLE",
+  "IDLE",
+  "LOAD_SUPPORT",
+  "BATTERY_EXPORT"
+ ],
+ "intra_period_discharge_allowed": [
+  true,
+  true,
+  true,
+  false
+ ],
+ "soe_trajectory": [
+  4.0,
+  4.0,
+  4.0,
+  2.7823529411764705,
+  1.0176470588235293
+ ],
+ "battery_solar_cost": 0.37600000000000006
+}

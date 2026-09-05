@@ -1,9 +1,10 @@
 import React, { useState, useEffect, useMemo } from 'react';
 import api from '../lib/api';
 import { useDashboardData } from '../hooks/useDashboardData';
-import { FormattedValue } from '../types';
+import { FormattedValue, ControlModel } from '../types';
 import { DashboardResponse } from '../api/scheduleApi';
-import { getIntent } from '../utils/intent';
+import { getIntent, isCurtailed } from '../utils/intent';
+import { formatFixed } from '../utils/format';
 import { 
   DollarSign, 
   Battery, 
@@ -23,6 +24,10 @@ export interface StatusCardProps {
   keyValue: number | string;
   keyUnit: string;
   keyAnnotation?: string[];
+  // Small marker rendered under the headline (e.g. "Curtailed (No Export)").
+  // Kept separate from keyValue so a long marker can't widen the text-3xl
+  // headline past the card edge -- issue #676.
+  keyBadge?: string;
   metrics: Array<{
     label: string;
     value: number | string;
@@ -47,6 +52,7 @@ export const StatusCard: React.FC<StatusCardProps> = ({
   keyValue,
   keyUnit,
   keyAnnotation,
+  keyBadge,
   metrics,
   className = "",
   systemMode,
@@ -113,6 +119,11 @@ export const StatusCard: React.FC<StatusCardProps> = ({
           {keyValue}
           {keyUnit && <span className="text-lg font-normal text-gray-600 dark:text-gray-400 ml-2">{keyUnit}</span>}
         </p>
+        {keyBadge && (
+          <span className="col-start-1 justify-self-start -mt-1 inline-flex items-center rounded-md bg-stone-100 px-2 py-0.5 text-xs font-medium text-stone-600 dark:bg-stone-800 dark:text-stone-300">
+            {keyBadge}
+          </span>
+        )}
         {keyAnnotation && keyAnnotation.length > 0 && (
           <div className="col-start-2 justify-self-center flex flex-col items-end">
             {keyAnnotation.map((line) => (
@@ -171,7 +182,7 @@ interface SystemStatusCardProps {
 const formatDelta = (full?: FormattedValue | null, today?: FormattedValue): string | undefined => {
   if (!full || !today) return undefined;
   const delta = full.value - today.value;
-  return `${delta.toFixed(2)} ${today.unit}`;
+  return `${formatFixed(delta, 2)} ${today.unit}`;
 };
 
 const DASHBOARD_REFRESH_MS = 60000;
@@ -253,11 +264,14 @@ const SystemStatusCard: React.FC<SystemStatusCardProps> = ({ className = "", sys
       console.warn('BACKEND ISSUE: Missing or invalid hourlyData array in dashboardData');
     }
 
-    // Get actual battery mode from inverter status (not schedule)
-    if (!inverterData.batteryMode) {
+    // Get actual battery mode from inverter status (not schedule) -- only
+    // meaningful for tou_register installs; vpp_power/period_list have no
+    // mode register, see docs/superpowers/specs/2026-07-29-control-model-display-design.md.
+    const controlModel: ControlModel = inverterData.controlModel ?? 'tou_register';
+    if (controlModel === 'tou_register' && !inverterData.batteryMode) {
       throw new Error('MISSING DATA: inverterData.batteryMode is required but missing');
     }
-    const actualBatteryMode = inverterData.batteryMode;
+    const actualBatteryMode = controlModel === 'tou_register' ? inverterData.batteryMode : undefined;
 
     // Check for missing keys in hourly data
     if (currentHourData && currentHourData.batteryAction === undefined) {
@@ -283,10 +297,16 @@ const SystemStatusCard: React.FC<SystemStatusCardProps> = ({ className = "", sys
       IDLE: 'Standby',
     };
     const rawIntent = getIntent(currentHourData).toUpperCase().replace(/ /g, '_');
+    // Curtailment doesn't replace the intent (a curtailed period can still
+    // be charging, e.g. SOLAR_STORAGE) -- keep the intent as the headline and
+    // surface curtailment as its own badge (issue #676: appending
+    // " — Curtailed (No Export)" made the text-3xl headline overflow the card).
     const strategicIntent = intentDisplayNames[rawIntent] ?? rawIntent;
+    const strategicIntentCurtailed = isCurtailed(currentHourData);
 
     return {
       strategicIntent,
+      strategicIntentCurtailed,
       costAndSavings: {
         todaysCost: (() => {
           if (!dashboardData.summary?.netGridCost) {
@@ -400,6 +420,7 @@ const SystemStatusCard: React.FC<SystemStatusCardProps> = ({ className = "", sys
       keyValue: statusData.realTimePower?.solarPower?.text || '0 W',
       keyUnit: "",
       keyAnnotation: undefined as string[] | undefined,
+      keyBadge: undefined as string | undefined,
       metrics: [
         {
           label: "Home Usage",
@@ -437,6 +458,9 @@ const SystemStatusCard: React.FC<SystemStatusCardProps> = ({ className = "", sys
       keyValue: statusData.strategicIntent ?? 'Idle',
       keyUnit: "",
       keyAnnotation: undefined as string[] | undefined,
+      keyBadge: (statusData.strategicIntentCurtailed
+        ? 'Curtailed (No Export)'
+        : undefined) as string | undefined,
       metrics: [
         {
           label: "State of Charge",
@@ -463,7 +487,7 @@ const SystemStatusCard: React.FC<SystemStatusCardProps> = ({ className = "", sys
           unit: "kWh",
           icon: Zap
         },
-        {
+        ...(statusData.batteryStatus?.batteryMode ? [{
           label: "Battery Mode",
           value: (() => {
             const mode = statusData.batteryStatus.batteryMode?.toLowerCase() ?? '';
@@ -476,7 +500,7 @@ const SystemStatusCard: React.FC<SystemStatusCardProps> = ({ className = "", sys
           })(),
           unit: "",
           icon: Battery
-        }
+        }] : [])
       ]
     },
     {
@@ -499,6 +523,7 @@ const SystemStatusCard: React.FC<SystemStatusCardProps> = ({ className = "", sys
             `Tomorrow: ${statusData.costAndSavings?.tomorrowCostText}`,
           ]
         : undefined,
+      keyBadge: undefined as string | undefined,
       metrics: [
         {
           label: "Grid-Only Cost",
@@ -549,6 +574,7 @@ const SystemStatusCard: React.FC<SystemStatusCardProps> = ({ className = "", sys
           keyValue={card.keyValue}
           keyUnit={card.keyUnit}
           keyAnnotation={card.keyAnnotation}
+          keyBadge={card.keyBadge}
           metrics={card.metrics}
           systemMode={systemMode}
         />

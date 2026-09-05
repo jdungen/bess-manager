@@ -11,17 +11,27 @@ non-negotiable and apply to all agents.
 - NEVER speculate about file contents or behavior - read the file or run the code first
 - Before proposing any fix, show the exact code path and evidence (logs, source) that proves the root cause — do not guess at entity names, prefixes, or discovery logic
 
+## Issue Work
+
+- Any request to fix, resolve, or implement a GitHub issue (e.g. "fix #123",
+  "resolve this issue") MUST go through the `implement-issue` skill from the
+  start — not ad-hoc brainstorming, writing-plans, or direct edits. It already
+  encodes PR hygiene rules (e.g. don't commit plan files) that get skipped
+  otherwise.
+
 ## Agent Documentation Index
 
 | File | When to Read |
 |------|-------------|
 | [`docs/agents/rules.md`](docs/agents/rules.md) | **Always** — hard constraints |
 | [`docs/agents/architecture.md`](docs/agents/architecture.md) | Before any structural change |
+| [`docs/agents/optimizer-architecture.md`](docs/agents/optimizer-architecture.md) | **Normative** — before any change to the optimizer core (`action_selector.py`, `dp_battery_algorithm.py`, `pwl_window_dp.py`, `tie_detection.py`, flow derivation, intent, simulation) |
 | [`docs/agents/patterns.md`](docs/agents/patterns.md) | Before writing new code |
 | [`docs/agents/testing.md`](docs/agents/testing.md) | Before writing or changing tests |
 | [`docs/agents/workflow.md`](docs/agents/workflow.md) | Before any commit, PR, or release |
 | [`docs/agents/skill-architecture.md`](docs/agents/skill-architecture.md) | Before working on skills, the `@claude-bot` pipeline, or adding an integration |
 | [`docs/agents/bess-knowledge.md`](docs/agents/bess-knowledge.md) | Before answering any question about BESS behavior, savings calculations, optimizer decisions, or schedule logic |
+| [`docs/agents/local-agent-environment.md`](docs/agents/local-agent-environment.md) | Before autonomous local work — worktrees, permissions, the OS sandbox, podman, Playwright |
 | [`docs/agents/memory/`](docs/agents/memory/) | Project-specific memory (beta workflow, release train) |
 
 ## Project Overview
@@ -36,7 +46,7 @@ interface for managing battery schedules and monitoring energy flows.
 
 ```bash
 .venv/bin/pytest -m "not slow"           # fast tests (~3s, recommended)
-.venv/bin/pytest -m slow                 # algorithm/integration tests (~30min)
+.venv/bin/pytest -m slow                 # algorithm/integration tests (~4min)
 .venv/bin/pytest                         # run all tests
 .venv/bin/black . && .venv/bin/ruff check --fix .  # format and lint
 ./scripts/quality-check.sh               # full quality gate
@@ -86,7 +96,7 @@ through CLAUDE.md. All stages run on `anthropics/claude-code-action@v1`.
 |-------|---------|----------|------|--------------|
 | 1. Triage | `issues: opened/edited` (auto) | `issue-triage.yml` | ~$0.05 | Classify + label only. Gates on debug log presence. |
 | 2. Analyze | `@claude-bot analyze` (manual) | `issue-analyze.yml` | ~$0.50–2 | Delegates to `bess-analyst` sub-agent, posts root-cause diagnosis. No code changes. |
-| 3. Fix | `@claude-bot fix` (manual) | `issue-fix.yml` | ~$1–4 | Implements minimal fix per Stage 2 plan, runs `quality-check.sh`, opens draft PR. |
+| 3. Fix | `@claude-bot fix` (manual) | `issue-fix.yml` | ~$1–4 | Runs the `implement-issue` skill in CI mode per the Stage 2 plan, opens draft PR. |
 | 4. Review | `@claude-bot` on a PR (manual) | `pr-review.yml` | ~$0.50–2 | Reviews diff against rules and checklist. |
 | 5. Integrate | `@claude-bot integrate` (manual) | `issue-integrate.yml` | ~$2–10 | Drives a new inverter/provider request through the full experimental→stable lifecycle (`feature-lifecycle`), one stage per invocation. |
 
@@ -114,9 +124,48 @@ of `analyzed`.
 
 ### General bot rules
 
-- Only the repo owner can trigger bot commands.
+- Bot commands are owner-triggered, with **two** exceptions, each matching an
+  account that a documented rule already makes responsible for that spend:
+  - **Stage 4** — `pr-review.yml` accepts `@claude-bot` from the developer
+    identity (currently `bess-agent`; being renamed to `bess-developer` — see
+    `scripts/gh-agent.sh`), so `implement-issue`'s Step 11 loop can request its
+    own review.
+  - **Stage 2** — `issue-analyze.yml` accepts `@claude-bot analyze` from
+    `bess-product-owner`, because `backlog`'s Autonomous spend rule authorises
+    exactly that trigger and bounds it (labelled `bug`, external reporter,
+    debug log attached, no prior analyze). The rule existed before the gate
+    accepted the account enforcing it, so the only way to satisfy both was to
+    post as the maintainer — putting their name on comments they never wrote
+    and hiding which decisions were the agent's. An automation decision should
+    carry the automation's face.
+
+  **Stages 1, 3 and 5 stay owner-only, and must not copy this.** Their spend
+  ($1–4 and $2–10) is authorised by no autonomous rule, so nothing would be
+  enforcing a bar on the other side of the gate.
+
+  Only ever name a **registered** account in a gate. `bess-developer` is added
+  in the same commit that renames the account, never before: on a public repo
+  anyone can claim an unregistered username, so pre-authorising one is
+  exploitable. `bess-product-owner` is named above because it exists today and
+  is a collaborator.
+- Automation writes carry a **role** identity, and role is the axis:
+  `bess-product-owner` (intake, backlog, board, reporter comments),
+  `bess-developer` (analyze, fix, PR authorship, requesting review),
+  `bess-reviewer` (Stage 4 review only). Developer and Reviewer are
+  deliberately distinct — Stage 4 reviews Stage 3's own output, and one shared
+  face would read as an account approving its own PR. Post via
+  `scripts/gh-agent.sh --as po|dev`. Genuine maintainer voice still uses plain
+  `gh`.
 - Always use `gh` CLI for all GitHub operations (issues, PRs, labels).
-- Never push directly to `main`. PRs are always opened as drafts.
+- Never push directly to `main`. PRs are always *opened* as drafts, and no
+  agent ever merges one — the merge is the maintainer's, always.
+- **Who takes a PR out of draft depends on which flow opened it.** An
+  interactive `implement-issue` run drives its own review loop, so its
+  Step 11 marks the PR ready (`gh pr ready`) the moment Stage 4 returns
+  `APPROVED`, leaving only the merge. A **Stage 3 (`issue-fix.yml`) PR stays
+  a draft even after Stage 4 approves it** — CI mode skips Step 11, so
+  nothing there runs `gh pr ready`, and you are triggering that review by
+  hand anyway. Flip it yourself when you're satisfied.
 - The bot identity is `bess-manager-claude-bot` (a custom GitHub App). The
   official Anthropic Claude App is **suspended** to avoid collisions —
   do not unsuspend it.
@@ -140,17 +189,19 @@ of `analyzed`.
 - Do not revert intentional linter changes or simplifications without explicit instruction
 - After editing, list every file and symbol changed so the user can confirm nothing unrelated was touched
 - Never add speculative fallbacks, defensive error handling, or "robustness" improvements beyond what was asked
+- Never add a parameter, flag, default-fallback, second construction site, or extra trigger whose only job is to route around an ordering/timing/dependency problem — fix that problem directly (reorder, or reuse/expose what already exists); see `docs/agents/rules.md` Debugging Protocol step 8
 
 ## Cost Discipline
 
 The user pays per token. A long Opus session that re-reads a large context after
 every multi-minute wait is what runs up the bill — not the work itself.
 
-- **Default to Sonnet** (set in `.claude/settings.json`). Use Opus only for a
-  genuinely hard reasoning step, say so, and drop back. Don't run routine
-  coordination, iteration, CI-watching, or file edits on Opus.
-- **Never spawn Opus subagents**, and avoid agents for long-running watches
-  entirely; if delegation is truly needed, use a cheap model.
+- **Pick the best-fit model per task.** No model is pinned in
+  `.claude/settings.json`, so sessions start on the Claude Code default.
+  Reach for a stronger model on genuinely hard reasoning, and prefer a
+  cheaper one for routine coordination, iteration, CI-watching, or file edits.
+- **Don't put subagents on an expensive model**, and avoid agents for
+  long-running watches entirely; if delegation is truly needed, use a cheap model.
 - **Don't hold one big session across many long CI/test waits.** The prompt
   cache expires after ~5 min, so each long wait forces a full uncached re-read
   of the entire context. Prefer `/clear` between unrelated chunks, or let the
@@ -160,26 +211,6 @@ every multi-minute wait is what runs up the bill — not the work itself.
   a session boundary.** Kick it off, then either let the session sit idle
   until it completes or `/clear` and resume fresh once it's done — don't
   stay engaged re-touching the diagnosis/TDD context through the wait.
-
-## Worktree Conventions
-
-Both layouts are first-class — either way the worktree is a normal git checkout,
-so per-agent inspect / test / run (`./deploy.sh`, `pytest`, the app) works the
-same. Choose by how you want to reach an agent's work:
-
-- **Sibling folders** (e.g. `../bess-manager-feature/`) — open cleanly in their
-  own VS Code window; this is the go-to when you actively inspect code and run
-  scripts per agent. They work with Agent View too: start the background session
-  *inside* the sibling (it's a linked git worktree, so Claude won't relocate it).
-  Caveat: a sibling only appears in **unscoped** `claude agents` (or
-  `--cwd ~/GitHub`), not in the project-scoped `claude agents --cwd <repo>` view.
-- **Native `.claude/worktrees/`** (`claude agents` / `--worktree` /
-  `EnterWorktree`) — auto-created for background sessions and visible in the
-  **project-scoped** Agent View. Still a real checkout: `code
-  <repo>/.claude/worktrees/<name>` or `cd` into it to run tests/scripts.
-
-Find any session's worktree path by peeking/attaching it in Agent View, or via
-`claude agents --json` (the `cwd` field).
 
 ## Home Assistant Integration
 

@@ -283,6 +283,16 @@ def _scrub_entity_registry_entry(
 # Patterns that identify actionable log lines worth including in compact exports.
 # These cover: errors/warnings, hardware commands, key decisions, feature-specific
 # events (discharge inhibit, charge power), and intent transitions.
+#
+# All six strategic intents (not just the three battery-active ones) must be
+# listed here: each per-period box-table row in dp_battery_algorithm.py's
+# schedule log embeds its own Intent column, so a row only survives
+# compaction if its intent string matches this pattern. Dropping
+# SOLAR_EXPORT/SOLAR_STORAGE/IDLE silently discarded every earlier-run
+# schedule row for periods where the DP wasn't actively charging/discharging
+# -- typically all of a day's solar hours -- which broke bess-analyst's
+# documented cross-run reconciliation (extract_decision_evidence.py,
+# bess-analyst.md) for exactly those periods. Found investigating #466.
 _LOG_KEY_PATTERNS = re.compile(
     r"WARNING|ERROR|CRITICAL"
     r"|HARDWARE:"
@@ -290,7 +300,7 @@ _LOG_KEY_PATTERNS = re.compile(
     r"|Intent transition|DECISION:"
     r"|Starting optimization|Optimization complete"
     r"|Applying period|Apply schedule"
-    r"|LOAD_SUPPORT|BATTERY_EXPORT|GRID_CHARGING"
+    r"|LOAD_SUPPORT|BATTERY_EXPORT|GRID_CHARGING|SOLAR_EXPORT|SOLAR_STORAGE|IDLE"
     r"|TOU hardware|TOU conversion|schedule created"
     r"|Setting.*power rate|power rate.*set",
     re.IGNORECASE,
@@ -304,6 +314,58 @@ _COMPACT_LOG_TAIL = 50  # Always include this many trailing lines for recent con
 # no way to show what happened yesterday evening unless it also reads from
 # DailyViewStore, which is never cleared.
 _PREVIOUS_DAYS_TO_INCLUDE = 2
+
+
+def _periods_signature(predicted_periods: list) -> dict[int, dict]:
+    """Map period -> its full serialized payload, for change detection.
+
+    Two snapshots "agree" about a period only if EVERYTHING they say about
+    it matches -- not just the DP's decision. Keying on
+    (strategic_intent, battery_action) alone, as this did before #555, is
+    not enough to call a period unchanged: a period keeps its decision while
+    its SOE trajectory and economics shift underneath it, because those
+    depend on what the DP decided for *other* periods. Measured over a
+    96-run day, 2,588 period payloads moved while only 292 decisions did --
+    so a decision-keyed delta would silently drop the input changes that
+    `bess-analyst` is documented to diff when explaining a flip.
+
+    The comparison is exact, with no float tolerance. A tolerance was tried
+    (6dp) and rejected: it saved 26 of 2,614 period objects on that same
+    96-run day -- under 1% -- while making the reconstruction only
+    approximate, which is not worth giving up "replay the deltas and you have
+    byte-identical forecasts" as a property a reader can rely on.
+    """
+    return {p.period: asdict(p) for p in predicted_periods}
+
+
+def _period_delta(current: dict, previous: dict | None) -> dict:
+    """The fields of `current` that differ from `previous`, keyed by period.
+
+    Emitting whole period objects for every period that moved is still
+    wasteful: what usually moves is two or three of ~37 fields (the SOE
+    trajectory and a derived cost), while the other 34 are re-serialized
+    unchanged. Measured over a 96-run day, whole-object deltas cost 3.06 MB
+    against 0.51 MB for field-level ones -- same information, six times the
+    bytes.
+
+    Returns `{}` when nothing changed, and the complete payload when the
+    period has no predecessor (its first appearance is its baseline).
+    """
+    if previous is None:
+        return current
+
+    delta: dict = {"period": current["period"]}
+    for key, value in current.items():
+        if key == "period":
+            continue
+        prior = previous.get(key)
+        if isinstance(value, dict) and isinstance(prior, dict):
+            nested = {k: v for k, v in value.items() if prior.get(k) != v}
+            if nested:
+                delta[key] = nested
+        elif prior != value:
+            delta[key] = value
+    return delta if len(delta) > 1 else {}
 
 
 @dataclass
@@ -502,7 +564,14 @@ class DebugDataAggregator:
             Battery settings as dictionary
         """
         try:
-            return asdict(self.system.battery_settings)
+            settings = asdict(self.system.battery_settings)
+            # Resolved capability-aware flag (enabled AND the platform
+            # supports export-limit control) -- not a stored setting, so
+            # from_debug_log.py can't reconstruct it from the settings alone.
+            settings["export_curtailment_active"] = (
+                self.system.export_curtailment_active
+            )
+            return settings
         except Exception as e:
             logger.warning("Failed to serialize battery settings: %s", e)
             return {}
@@ -558,6 +627,9 @@ class DebugDataAggregator:
         InfluxDB username and password are stripped — URL is retained for
         diagnosing connection issues.
 
+        Remaining values go through the same _redact_secrets() pass used for
+        the other sections of the export.
+
         Returns:
             Settings dict with credentials redacted.
         """
@@ -568,7 +640,7 @@ class DebugDataAggregator:
                 influxdb.pop("username", None)
                 influxdb.pop("password", None)
                 options["influxdb"] = influxdb
-            return options
+            return _redact_secrets(options)
         except Exception as e:
             logger.warning("Failed to serialize addon options: %s", e)
             return {}
@@ -665,7 +737,7 @@ class DebugDataAggregator:
                     )
 
         try:
-            resolved = controller.discover_ha_metadata(device_sn=None)
+            resolved = controller.discover_ha_metadata()
         except Exception as e:
             resolved = {"error": str(e)}
 
@@ -722,9 +794,8 @@ class DebugDataAggregator:
         # from a curated subset like METHOD_SENSOR_MAP, means a new
         # entity-reading code path (TOU segments, VPP registers, ...) is
         # automatically captured for replay without needing a matching
-        # special case here. BESSController.refresh_active_sensors() keeps
-        # this map synced with SettingsStore after every settings mutation,
-        # so it's never a stale startup-time copy.
+        # special case here. controller.sensors is a live SettingsStore view
+        # (#334), so it's never a stale startup-time copy.
         seen_entities: set[str] = set(controller.sensors.values())
         for entity_id in seen_entities:
             if entity_id:
@@ -767,10 +838,13 @@ class DebugDataAggregator:
         return snapshot
 
     def _serialize_inverter_tou(self) -> list[dict]:
-        """Serialize the current inverter TOU segments from memory.
+        """Serialize the TOU segments this controller intends to have on hardware.
 
-        Returns the segments that were last read from / written to the inverter,
-        so debug log replays can seed the mock with the real inverter state.
+        NOT a hardware read: active_tou_intervals is the *desired* schedule.
+        Since #551 that is explicitly not the same thing as what the inverter
+        holds — the two diverging is the bug that issue documents — so a replay
+        seeded from this reproduces the plan, not the inverter's real state.
+        Reproducing hardware drift needs a genuine read (see #553).
 
         Returns:
             List of TOU segment dicts as held in active_tou_intervals
@@ -925,12 +999,54 @@ class DebugDataAggregator:
         """Serialize prediction snapshots from today.
 
         Args:
-            compact: If True, return ALL snapshots as 5-field summary rows
-                (timestamp, period, predicted_savings, actual_count, predicted_count).
-                This enables the full-day prediction evolution table for use case 3
-                (morning prediction vs evening actual analysis) at ~6 KB instead
-                of 166 KB for the complete JSON.
-                If False, return full snapshot data for all snapshots.
+            compact: If True, return one entry per snapshot with the 5
+                summary fields (timestamp, period, predicted_savings,
+                actual_count, predicted_count) for the full-day evolution
+                table, PLUS that run's own forward-looking forecast
+                (`predicted_periods_delta`, drawn from the periods with
+                data_source == "predicted", i.e. every period NOT already realized at that
+                run's own decision time -- exact buy/sell/solar/consumption/
+                SOE/shadow_price/intent, not the rounded box-table version).
+                Already-realized periods are deliberately excluded: they're
+                the same data every earlier snapshot that day would also
+                carry, and are already exported in full once, at exact
+                precision, in Historical Sensor Data -- repeating them per
+                snapshot would be pure duplication for no analytical value,
+                since a past period's *actual* outcome doesn't change
+                between snapshots (only the forecast for what's still ahead
+                does). This is what makes two runs' schedules actually
+                diffable: `optimize_battery_schedule()`'s own forward
+                horizon input, not a log line.
+
+                The forecast is emitted as `predicted_periods_delta`: for each
+                period that moved, only the FIELDS that moved (plus `period`
+                to key it) -- see `_period_delta`. Alongside it,
+                `predicted_periods_dropped` lists the period indices that left
+                the forecast entirely (they realized into actuals). A period's
+                first appearance carries its complete payload, so there is
+                always a baseline to replay onto. A reader reconstructs any
+                snapshot's complete forecast by deep-merging each delta over
+                the accumulated state, keyed by period index, and deleting the
+                dropped indices. An empty delta means the plan didn't move
+                that cycle. Both halves are needed: the forecast window shrinks
+                every cycle, and a departure has no delta entry to carry it,
+                so deltas alone reconstruct a forecast that never shrinks.
+
+                Deduping per snapshot instead of per period (what this did
+                before #555) was nearly useless in practice: a single
+                marginal period flips on most cycles, and one flip
+                re-serialized the entire remaining forecast. On the reference
+                bundle that wrote 4,275 period objects to carry 314 periods'
+                worth of actual change -- 6.78 MB of a 9.04 MB export. The
+                key is deliberately NOT named `predicted_periods`: bundles
+                already attached to issues use that name for a *whole*
+                forecast, and they are regression fixtures, so the two
+                encodings must stay distinguishable by key rather than
+                silently redefining one. The evolution
+                table's summary fields are never deltaed -- every run still
+                gets its own row there regardless.
+                If False, return full snapshot data (all periods, actual and
+                predicted) for all snapshots, no deduplication.
 
         Returns:
             List of snapshot dictionaries
@@ -941,16 +1057,49 @@ class DebugDataAggregator:
                 return []
             if not compact:
                 return [asdict(snapshot) for snapshot in snapshots]
-            # Compact: all snapshots as summary rows for the evolution table.
+            # Compact: summary fields (evolution table) + the periods of that
+            # run's forward-looking forecast that actually moved since the
+            # previous snapshot (cross-run diffing) -- see docstring.
             # Use grid_only_cost - hourly_cost to match the dashboard total
             # savings definition (includes both solar and battery benefit).
             result = []
+            prev_signature: dict[int, dict] = {}
             for snapshot in snapshots:
                 total_savings = sum(
                     p.economic.grid_only_cost - p.economic.hourly_cost
                     for p in snapshot.daily_view.periods
                     if p.economic is not None
                 )
+                predicted = [
+                    p
+                    for p in snapshot.daily_view.periods
+                    if p.data_source == "predicted"
+                ]
+                signature = _periods_signature(predicted)
+                # A period is worth emitting if its payload differs (any
+                # field, not just the decision) from what the previous
+                # snapshot said about it. `prev_signature.get()` covers the
+                # two cases together: a payload that changed, and a period
+                # the previous snapshot never covered at all (new
+                # information, not an unchanged payload). The first snapshot
+                # of the day sees an empty prev_signature, so it emits the
+                # full forecast as the baseline the deltas replay onto.
+                delta = [
+                    d
+                    for d in (
+                        _period_delta(signature[p.period], prev_signature.get(p.period))
+                        for p in predicted
+                    )
+                    if d
+                ]
+                # Periods that left the forecast since the previous snapshot,
+                # normally because they realized into actuals as the day moved
+                # on. A departure is invisible in the delta -- there is no
+                # entry to carry it -- so without this a reader replaying
+                # deltas keeps every realized period forever and reports a
+                # forecast that never shrinks.
+                dropped = sorted(prev_signature.keys() - signature.keys())
+                prev_signature = signature
                 result.append(
                     {
                         "snapshot_timestamp": snapshot.snapshot_timestamp.isoformat(),
@@ -958,6 +1107,8 @@ class DebugDataAggregator:
                         "total_savings": total_savings,
                         "actual_count": snapshot.daily_view.actual_count,
                         "predicted_count": snapshot.daily_view.predicted_count,
+                        "predicted_periods_delta": delta,
+                        "predicted_periods_dropped": dropped,
                     }
                 )
             return result

@@ -209,13 +209,13 @@ The logs show:
 **Causes**:
 
 - Sensor timing differences
-- InfluxDB data gaps
+- Recorder history gaps for the affected hours
 - Battery efficiency losses
 
 **Solutions**:
 
 - Check all sensors are reporting correctly
-- Verify InfluxDB integration is working
+- Verify Home Assistant's recorder is retaining these sensors (not excluded, `purge_keep_days` ≥ 2)
 - Small imbalances (<5%) are normal due to efficiency losses
 
 ### "Battery not following schedule"
@@ -275,7 +275,7 @@ For UK users on the Octopus Energy Agile tariff.
 
 #### Provider: ENTSO-e / Belpex (Transparency Platform)
 
-For European users on a day-ahead dynamic tariff that follows the ENTSO-e Transparency Platform — including Belgian **Belpex** prices (Luminus dynamic and others). *Experimental: not yet real-world validated — see [issue #126](https://github.com/johanzander/bess-manager/issues/126).*
+For European users on a day-ahead dynamic tariff that follows the ENTSO-e Transparency Platform — including Belgian **Belpex** prices (Luminus dynamic and others).
 
 - **Prerequisites**: The [ENTSO-e Transparency Platform](https://github.com/JaccoR/hass-entso-e) HACS integration installed and configured with your area (e.g. Belgium). It creates an "Average electricity price" sensor, e.g. `sensor.belpex_h_average_electricity_price`.
 - **How it works**: BESS reads the `prices_today` and `prices_tomorrow` attributes from that single sensor. Each is a list of `{"time", "price"}` entries. Hourly data (PT60M, 24/day) is expanded to the internal 15-minute resolution; native quarterly data (PT15M, 96/day) is used as-is.
@@ -302,7 +302,9 @@ For Octopus Energy, prices are already final (VAT-inclusive, GBP/kWh). Markup, V
 
 BESS needs a forecast of your home consumption to plan the battery schedule. Four strategies are available, configured via `home.consumption_strategy` in your add-on settings:
 
-#### Strategy 1: `sensor` (default)
+#### Strategy 1: `sensor` (legacy)
+
+This strategy is selectable only once the `48h_avg_grid_import` sensor is configured: it is the one strategy with no fallback, so choosing it without that sensor means no schedule can be built at all and the dashboard never leaves "Initializing". New installs default to `fixed`; `ha_statistics` is the recommended choice (see [INSTALLATION.md](INSTALLATION.md), Step 3).
 
 BESS reads a Home Assistant sensor named `*48h_avg*grid_import*` (the exact entity ID is auto-discovered by name pattern). This sensor should be a 48-hour rolling average of your grid import power, filtered to exclude periods when the battery is active. See [INSTALLATION.md](INSTALLATION.md), Step 3 for how to create it.
 
@@ -321,17 +323,15 @@ The 48h window is a sensible default. If your consumption varies strongly with s
 
 Uses a single fixed kWh/hour value set in `home.default_hourly`. No sensor required. Useful as a fallback or for very predictable consumption, but does not adapt to actual usage.
 
-#### Strategy 3: `influxdb_7d_avg`
+#### Strategy 3: `load_power_7d_avg`
 
-Queries InfluxDB for the past 7 days of your local load power sensor and builds a 96-period average profile (one value per 15-minute slot, averaged across the same slot for the last 7 days). This gives a time-of-day shaped forecast — higher during evening peaks, lower overnight — rather than a flat value.
+Reads the past 7 days of your local load power sensor from Home Assistant's recorder and builds a 96-period average profile (one value per 15-minute slot, averaged across the same slot for the last 7 days). This gives a time-of-day shaped forecast — higher during evening peaks, lower overnight — rather than a flat value.
 
-Requires `local_load_power` sensor configured in your add-on sensor settings and InfluxDB access.
-
-This should give the best prediction of the three options, but require an influxdb to be set up.
+Requires the `local_load_power` sensor configured in your add-on sensor settings. Unlike `ha_statistics` it does **not** need a `lifetime_load_consumption` entity, so it works on platforms (e.g. SolaX Native, Solis) that only derive that value. (Was named `influxdb_7d_avg` before it moved to the recorder; the old id is still accepted.)
 
 #### Strategy 4: `ha_statistics`
 
-Uses Home Assistant's built-in Recorder long-term statistics to build a 96-period time-of-day consumption profile from the past 7 days. Like `influxdb_7d_avg`, this produces a shaped forecast — higher during evening peaks, lower overnight — but without requiring an external database.
+Uses Home Assistant's built-in Recorder long-term statistics to build a 96-period time-of-day consumption profile from the past 7 days. Like `load_power_7d_avg`, this produces a shaped forecast — higher during evening peaks, lower overnight — but from the cumulative load-energy statistics rather than instantaneous power samples.
 
 Requires the `lifetime_load_consumption` sensor configured in the **Sensors** tab (under Consumption Forecast). This should be a cumulative energy sensor (kWh) tracked by HA's long-term statistics — for example `sensor.load_energy_total` from your inverter integration.
 
@@ -344,9 +344,80 @@ Requires the `lifetime_load_consumption` sensor configured in the **Sensors** ta
 
 This is the recommended strategy for most users — it adapts to your actual usage patterns with no extra integrations or configuration beyond a cumulative load sensor.
 
+#### Managed Loads — excluding a regular habit from the baseline
+
+The trimmed mean above filters out an occasional spike, but not a *regular* one — if you charge your EV most nights, `ha_statistics` learns that as part of your normal pattern and forecasts it every night, whether or not you're actually charging. **Managed Loads** is how you tell BESS to exclude a load entirely and announce it yourself instead.
+
+In the **Home** settings tab, under `ha_statistics`, add the load's own cumulative/lifetime energy sensor (e.g. `sensor.ev_charger_energy_total` — most EV chargers expose one; tools like evcc can synthesize one for chargers that don't) to **Managed load sensors**. BESS subtracts that sensor's energy from the historical data before computing the baseline, so the learned "normal" becomes the residual — your house load with the managed load excluded.
+
+With the load excluded, it simply isn't forecast at all unless you say otherwise — the recommended setup is to exclude it here, then announce expected sessions via **Planned Consumption Changes** below (e.g. "EV needs 8 kWh by 06:30"). This is the same residual-plus-announcement pattern EMHASS uses for controllable loads.
+
+Only `ha_statistics` supports this today — `load_power_7d_avg` draws from a different data source and would need its own mechanism.
+
 #### Comparing Strategies
 
 The **Insights** page includes a **Consumption Forecast Comparison** section that evaluates all available strategies against your actual consumption. Each strategy shows its hourly profile overlaid on actual data, along with a Mean Absolute Error (MAE) metric. Use this to verify which strategy best matches your real consumption patterns before committing to one.
+
+#### Planned Consumption Changes — telling BESS what's coming
+
+Every strategy above describes your *normal* usage. None of them can know the EV is charging tonight, that you're skipping the pool pump, or that a heatwave will have the AC running all afternoon. **Planned Consumption Changes** is how you say so.
+
+It is not a fifth strategy — it applies on top of whichever one you use. If you never configure it, nothing changes.
+
+Create a template sensor whose `blocks` attribute lists what differs, then point BESS at it in the **Sensors** tab under **Planned Consumption Changes**.
+
+```yaml
+template:
+  - sensor:
+      - name: "BESS Planned Consumption Changes"
+        # `state` is cosmetic -- BESS reads the `blocks` attribute below
+        # regardless of it, precisely so a helper this depends on going
+        # temporarily "unknown" can't block your schedule. Anything
+        # human-readable works; a fixed literal is simplest.
+        state: "ok"
+        attributes:
+          blocks: >
+            {% set blocks = [] %}
+            {# The EV charges overnight: 40 kWh between 22:00 and 06:00.
+               Anchor to YESTERDAY's 22:00 in the small hours, otherwise
+               today_at('22:00') rolls forward at midnight and the running
+               session vanishes from the forecast exactly when it matters. #}
+            {% if is_state('input_boolean.ev_charging_tonight', 'on') %}
+              {% set ev_start = today_at('22:00') - timedelta(days=1)
+                   if now() < today_at('06:00') else today_at('22:00') %}
+              {% set blocks = blocks + [{
+                'start': ev_start.isoformat(),
+                'end': (ev_start + timedelta(hours=8)).isoformat(),
+                'energy_kwh': 40.0
+              }] %}
+            {% endif %}
+            {# Away for the day: hold the whole daytime near zero #}
+            {% if is_state('input_boolean.away_today', 'on') %}
+              {% set blocks = blocks + [{
+                'start': (today_at('08:00')).isoformat(),
+                'end': (today_at('18:00')).isoformat(),
+                'energy_kwh': 1.0,
+                'mode': 'set'
+              }] %}
+            {% endif %}
+            {{ blocks }}
+```
+
+Each entry is a time span plus the energy for that whole span:
+
+| Field | Meaning |
+|---|---|
+| `start`, `end` | ISO-8601 timestamps. **Must include a UTC offset** — `isoformat()` on a HA template time gives you one. |
+| `energy_kwh` | Total kWh across the span, spread over the periods it covers. Not a per-period value. |
+| `mode` | `add` (default) adds to your normal forecast; a **negative** value subtracts. `set` replaces it across the span. |
+
+Use `add` for things that are happening on top of normal (the EV tonight), a negative `add` for a regular load that *isn't* happening (the EV is away, so subtract the usual evening session), and `set` for the blunt cases where you don't know what the baseline holds — away for a week, or forcing a window near zero.
+
+Entries can be timestamped for tomorrow; BESS places them on the real horizon, so an entry that starts at 22:00 and runs to 06:00 is correctly split across midnight.
+
+**One trap when writing overnight entries:** `today_at()` re-evaluates against the current day, so an entry anchored at `today_at('22:00')` jumps forward a full day the moment midnight passes — taking the still-running session out of the forecast just as the optimizer needs it. Anchor to the previous day while you are still inside the window, as the example above does.
+
+**If the declaration is broken, BESS says so rather than ignoring it.** A missing, unavailable or malformed entity is reported as an error on the system health check — declaring an EV session and having it silently dropped would be worse than a clear failure. The one thing BESS corrects rather than rejects: if a subtraction removes more load than your forecast contains, that period is clamped to zero and a warning is raised, because negative consumption isn't physical.
 
 ### EV Charging and Discharge Inhibit
 
@@ -354,7 +425,7 @@ BESS does not control EV charging — it is designed to work alongside it. Under
 
 The exception is grid reward programs such as **Tibber grid rewards**. These programs can start EV charging for grid balancing reasons, even when the spot price is not at its lowest. If BESS were to discharge the battery at the same time, that energy would flow toward the car instead of from the grid — you would miss the grid reward income and also lose the battery capacity you would otherwise have had available for the home.
 
-To prevent this, BESS auto-detects any `binary_sensor` whose entity ID ends with `_charging` (for example `binary_sensor.zap263668_charging`) and treats it as a **discharge inhibit** signal. When the sensor is `on`, battery discharging is paused regardless of what the schedule says.
+To prevent this, BESS auto-detects any `binary_sensor` whose entity ID ends with `_charging` or `_is_charging` (for example `binary_sensor.zap263668_charging`), or contains `discharge_inhibit`, and treats it as a **discharge inhibit** signal. When the sensor is `on`, battery discharging is paused regardless of what the schedule says.
 
 The discharge inhibit only affects discharging — it does not change the TOU schedule, trigger battery charging, or interfere with the EV charging session in any way.
 

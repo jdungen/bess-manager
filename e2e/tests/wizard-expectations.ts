@@ -26,6 +26,24 @@ export interface WizardExpectation {
   consumptionForecastFound: boolean;
   dischargeInhibitFound: boolean;
   weatherFound: boolean;
+  /** No current_l1/l2/l3 sensors were discovered (no CT clamps configured) — disables fuse protection regardless of platform capability. Optional, defaults to false. */
+  noPhaseSensors?: boolean;
+
+  /**
+   * Entity IDs that exist in HA but are disabled, so the sensor step must
+   * block and name them (#549). Optional — absent means nothing disabled.
+   */
+  disabledEntities?: string[];
+  /**
+   * The selected provider has no usable configuration, so the pricing step
+   * must block (#549). Optional, defaults to false.
+   */
+  pricingBlocked?: boolean;
+  /**
+   * The sensor step cannot be passed in this scenario (disabled entities),
+   * so every later step is unreachable. Tests that navigate past it skip.
+   */
+  sensorStepBlocked?: boolean;
 }
 
 export const EXPECTATIONS: Record<string, WizardExpectation> = {
@@ -148,19 +166,33 @@ export const EXPECTATIONS: Record<string, WizardExpectation> = {
     dischargeInhibitFound: true,
     weatherFound: true,
   },
+  // inverterPlatform and phaseCount confirmed against a live POST
+  // /api/setup/discover run, not the value this entry originally shipped
+  // with -- this scenario was never wired into CI, so the wizard's actual
+  // detected[0] auto-select (Growatt Cloud, since detected_inverter_platforms
+  // lists WS-detected cloud platforms before appending SolaX ones -- see
+  // ha_api_controller.py's detected_inverter_platforms assembly) had never
+  // been checked against this expectation.
   'ci-wizard-growatt-modbus': {
     growattFound: true,
     solaxFound: true,
-    inverterPlatform: 'solax_modbus_growatt_min',
+    inverterPlatform: 'growatt_server_min',
     nordpoolFound: true,
     octopusFound: false,
     autoSelectedProvider: 'nordpool_official',
-    phaseCount: 3,
+    phaseCount: null,
     solcastFound: false,
     consumptionForecastFound: false,
     dischargeInhibitFound: false,
     weatherFound: false,
   },
+  // ci-wizard-growatt-modbus-gen3 has no entry here on purpose: its fixture
+  // is missing the 5 VPP entities GEN3 (solax_modbus_growatt_sph) always
+  // requires -- battery_system_manager.py:291-292 documents GEN3 as
+  // VPP-only, no TOU path exists -- so "Next" never enables and the full
+  // wizard flow can't complete. It stays covered by test_scenario_discovery.py
+  // (backend-only, doesn't need wizard completion) instead of this Playwright
+  // suite. See docs/agents/testing.md's Wizard Scenario Matrix note.
   'ci-wizard-nordpool-solax': {
     growattFound: false,
     solaxFound: true,
@@ -200,5 +232,65 @@ export const EXPECTATIONS: Record<string, WizardExpectation> = {
     consumptionForecastFound: false,
     dischargeInhibitFound: false,
     weatherFound: false,
+  },
+  /** Real-world regression from issue #118: ridax67's live Growatt GEN4 VPP installation. */
+  'ci-wizard-growatt-vpp-ridax-118': {
+    growattFound: false,
+    solaxFound: true,
+    inverterPlatform: 'solax_modbus_growatt_min',
+    nordpoolFound: true,
+    octopusFound: false,
+    autoSelectedProvider: 'nordpool_official',
+    phaseCount: null,
+    solcastFound: true,
+    consumptionForecastFound: false,
+    dischargeInhibitFound: false,
+    weatherFound: false,
+    noPhaseSensors: true,
+  },
+  /**
+   * Real-world regression from issue #549: solax_modbus ships its Total *
+   * lifetime counters disabled_by=integration, and this HA has no Nord Pool
+   * integration at all. Both wizard gates must hold.
+   */
+  'ci-wizard-solax-disabled-lifetime': {
+    growattFound: false,
+    solaxFound: true,
+    inverterPlatform: 'solax_modbus_growatt_min',
+    nordpoolFound: false,
+    octopusFound: false,
+    autoSelectedProvider: 'nordpool_official',
+    phaseCount: 3,
+    solcastFound: false,
+    consumptionForecastFound: false,
+    dischargeInhibitFound: false,
+    weatherFound: false,
+    disabledEntities: [
+      'sensor.growatt_inverter_solax_total_grid_import',
+      'sensor.growatt_inverter_solax_total_grid_export',
+      'sensor.growatt_inverter_solax_total_solar_energy',
+      'sensor.growatt_inverter_solax_total_battery_input_energy',
+      'sensor.growatt_inverter_solax_total_battery_output_energy',
+    ],
+    sensorStepBlocked: true,
+  },
+  /**
+   * Issue #549, second half: all inverter sensors enabled, but HA has no
+   * price integration at all — the pricing step must block rather than
+   * persist the defaulted nordpool_official with an empty config entry.
+   */
+  'ci-wizard-no-price-provider': {
+    growattFound: false,
+    solaxFound: true,
+    inverterPlatform: 'solax_modbus_growatt_min',
+    nordpoolFound: false,
+    octopusFound: false,
+    autoSelectedProvider: 'nordpool_official',
+    phaseCount: 3,
+    solcastFound: false,
+    consumptionForecastFound: false,
+    dischargeInhibitFound: false,
+    weatherFound: false,
+    pricingBlocked: true,
   },
 };

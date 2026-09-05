@@ -11,7 +11,6 @@
       "max_charge_power_kw": 5.0,
       "max_discharge_power_kw": 5.0,
       "cycle_cost_per_kwh": 0.4,
-      "min_action_profit_threshold": 0.0,
       "efficiency_charge": 0.97,
       "efficiency_discharge": 0.95
     },
@@ -94,6 +93,27 @@
       "state": "3500",
       "attributes": {
         "unit_of_measurement": "W"
+      }
+    },
+    "sensor.main_breaker_current_l1": {
+      "state": "8.5",
+      "attributes": {
+        "unit_of_measurement": "A",
+        "device_class": "current"
+      }
+    },
+    "sensor.main_breaker_current_l2": {
+      "state": "4.2",
+      "attributes": {
+        "unit_of_measurement": "A",
+        "device_class": "current"
+      }
+    },
+    "sensor.main_breaker_current_l3": {
+      "state": "6.1",
+      "attributes": {
+        "unit_of_measurement": "A",
+        "device_class": "current"
       }
     },
     "number.growatt_mix_solax_battery_first_charge_rate": {

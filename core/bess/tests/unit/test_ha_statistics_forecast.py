@@ -5,8 +5,11 @@ from unittest.mock import patch
 
 import pytest
 
-from core.bess.battery_system_manager import BatterySystemManager
-from core.bess.exceptions import HAStatisticsUnavailableError
+from core.bess.battery_system_manager import (
+    BatterySystemManager,
+    ha_statistics_quarterly_profile,
+)
+from core.bess.exceptions import HAStatisticsUnavailableError, ManagedLoadsError
 from core.bess.runtime_failure_tracker import RuntimeFailureTracker
 from core.bess.settings import BatterySettings, HomeSettings
 from core.bess.tests.conftest import MockHomeAssistantController
@@ -316,3 +319,130 @@ class TestHAStatisticsDispatch:
 
         assert len(result) == 96
         assert all(v == 4.0 / 4.0 for v in result)
+
+
+class TestManagedLoadsSubtraction:
+    """Issue #706: managed_load_sensors excludes a load from the baseline."""
+
+    def test_forecast_reflects_residual_after_subtracting_managed_load(self) -> None:
+        """A flat managed load subtracted from a flat base halves the forecast."""
+        hourly_kwh = [2.0] * 24
+        ev_hourly_kwh = [1.0] * 24
+
+        base_stats = _make_hourly_stats(hourly_kwh)
+        ev_stats = _make_hourly_stats(ev_hourly_kwh)
+
+        controller = MockHomeAssistantController()
+        stat_id = "sensor.load_energy_total"
+        ev_stat_id = "sensor.ev_charger_energy_total"
+        manager = _create_manager_with_stats(
+            controller, {stat_id: base_stats, ev_stat_id: ev_stats}
+        )
+        manager.home_settings.managed_load_sensors = [ev_stat_id]
+
+        with patch("core.bess.battery_system_manager.time_utils") as mock_tu:
+            mock_tu.today.return_value = datetime(2026, 5, 12, tzinfo=TIMEZONE).date()
+            mock_tu.TIMEZONE = TIMEZONE
+            result = manager._get_ha_statistics_forecast()
+
+        # 2.0 kWh/h base - 1.0 kWh/h EV = 1.0 kWh/h residual = 0.25 kWh/quarter
+        assert len(result) == 96
+        assert all(v == pytest.approx(0.25) for v in result)
+
+    def test_no_managed_loads_leaves_forecast_unchanged(self) -> None:
+        """Baseline behaviour is unaffected when managed_load_sensors is empty."""
+        hourly_kwh = [2.0] * 24
+        stats = _make_hourly_stats(hourly_kwh)
+        controller = MockHomeAssistantController()
+        stat_id = "sensor.load_energy_total"
+        manager = _create_manager_with_stats(controller, {stat_id: stats})
+        assert manager.home_settings.managed_load_sensors == []
+
+        with patch("core.bess.battery_system_manager.time_utils") as mock_tu:
+            mock_tu.today.return_value = datetime(2026, 5, 12, tzinfo=TIMEZONE).date()
+            mock_tu.TIMEZONE = TIMEZONE
+            result = manager._get_ha_statistics_forecast()
+
+        assert all(v == pytest.approx(0.5) for v in result)
+
+    def test_missing_managed_load_statistics_raises(self) -> None:
+        """A configured managed-load sensor with no statistics data is a hard error,
+        not a silent skip -- the residual would otherwise silently overstate load."""
+        hourly_kwh = [2.0] * 24
+        base_stats = _make_hourly_stats(hourly_kwh)
+
+        controller = MockHomeAssistantController()
+        stat_id = "sensor.load_energy_total"
+        # No entry for the EV sensor's statistic_id in the mock response.
+        manager = _create_manager_with_stats(controller, {stat_id: base_stats})
+        manager.home_settings.managed_load_sensors = ["sensor.ev_charger_energy_total"]
+
+        with patch("core.bess.battery_system_manager.time_utils") as mock_tu:
+            mock_tu.today.return_value = datetime(2026, 5, 12, tzinfo=TIMEZONE).date()
+            mock_tu.TIMEZONE = TIMEZONE
+            with pytest.raises(ManagedLoadsError):
+                manager._get_ha_statistics_forecast()
+
+
+class TestQuarterlyProfileExtraction:
+    """The pure statistics -> profile transform, shared with scripts/knee_oracle.py.
+
+    It is module-level precisely so the oracle harness scores the forecast
+    production really held rather than a second implementation of the trimming
+    rule (#602/#687/#381). These pin the contract that harness depends on.
+    """
+
+    def test_returns_96_periods_and_counts_hours_with_data(self) -> None:
+        stats = _make_hourly_stats([0.4] * 24)
+
+        profile, hours_with_data = ha_statistics_quarterly_profile(stats, TIMEZONE)
+
+        assert len(profile) == 96
+        assert hours_with_data == 24
+        assert profile == pytest.approx([0.1] * 96)
+
+    def test_hours_without_samples_are_zero_and_uncounted(self) -> None:
+        """A gap must be visible to the caller, not smoothed into a real value.
+
+        The caller raises on too few hours; a zero that silently counted as
+        data would let a mostly-empty window through as a valid profile.
+        """
+        all_stats = _make_hourly_stats([0.4] * 24)
+        stats = [
+            entry
+            for entry in all_stats
+            if datetime.fromtimestamp(entry["start"] / 1000, tz=TIMEZONE).hour < 10
+        ]
+
+        profile, hours_with_data = ha_statistics_quarterly_profile(stats, TIMEZONE)
+
+        assert hours_with_data == 10
+        assert profile[40:] == pytest.approx([0.0] * 56)
+
+    def test_trimmed_mean_drops_min_and_max_at_seven_samples(self) -> None:
+        """The behaviour that makes this a central estimate, not a reserve.
+
+        Seven identical nights plus one spike: the spike is discarded. Correct
+        for forecasting a day's cost, and the reason the terminal knee
+        under-sizes an overnight reserve on a boiler night (#381).
+        """
+        stats = _make_hourly_stats([0.2] * 24, days=6)
+        spike = _make_hourly_stats([0.9] * 24, days=1)
+        for entry in spike:
+            entry["start"] += 7 * 24 * 3600 * 1000
+
+        profile, _ = ha_statistics_quarterly_profile(stats + spike, TIMEZONE)
+
+        # mean of the middle five 0.2 samples -- the 0.9 never lands
+        assert profile[0] == pytest.approx(0.05)
+
+    def test_production_forecast_agrees_with_the_shared_transform(self) -> None:
+        """The extraction must not have changed what production computes."""
+        stats = _make_hourly_stats([0.1 * h for h in range(24)])
+        expected, _ = ha_statistics_quarterly_profile(stats, TIMEZONE)
+
+        controller = MockHomeAssistantController()
+        stat_id = "sensor.load_energy_total"
+        manager = _create_manager_with_stats(controller, {stat_id: stats})
+
+        assert manager._get_ha_statistics_forecast() == pytest.approx(expected)

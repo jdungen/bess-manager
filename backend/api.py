@@ -7,6 +7,7 @@ import dataclasses
 import threading
 from datetime import date as date_cls
 from datetime import datetime, timedelta
+from typing import Any
 
 from api_conversion import (
     BATTERY_MODEL_ATTRS as _BATTERY_MODEL_ATTRS,
@@ -20,6 +21,7 @@ from api_conversion import (
 )
 from api_dataclasses import (
     _ENTITY_ID_RE,
+    _HA_DOMAIN_RE,
     APIConsumptionForecastComparison,
     APIDashboardHourlyData,
     APIDashboardResponse,
@@ -35,12 +37,28 @@ from fastapi import APIRouter, HTTPException, Query
 from loguru import logger
 
 from core.bess import time_utils
-from core.bess.health_check import describe_failing_checks, run_system_health_checks
+from core.bess.exceptions import SystemConfigurationError
+from core.bess.health_check import (
+    group_components_by_device,
+    run_system_health_checks,
+)
+from core.bess.influxdb_helper import is_influxdb_configured
 from core.bess.savings_aggregator import DEFAULT_COUNTS, build_buckets
-from core.bess.settings_store import VALID_PLATFORMS
+from core.bess.settings import canonicalize_consumption_strategy
+from core.bess.settings_store import VALID_PLATFORMS, flatten_sensors
 from core.bess.time_utils import get_period_count
 
 router = APIRouter()
+
+#: The wizard payload field each energy provider cannot work without.
+#: Mirrors BatterySystemManager._create_price_source, which needs exactly
+#: these to construct a usable PriceSource (#549).
+_PROVIDER_REQUIRED_FIELD: dict[str, str] = {
+    "nordpool_official": "nordpoolConfigEntryId",
+    "nordpool_hacs": "nordpoolEntity",
+    "octopus": "octopusImportTodayEntity",
+    "entsoe": "entsoeEntity",
+}
 
 
 def _get_hourly_settings_from_periods(schedule_manager, hour: int) -> dict:
@@ -110,6 +128,108 @@ def _strip_empty_sensor_values(sensors: dict) -> dict:
         else:
             result[key] = value
     return result
+
+
+def _validate_power_monitoring_sensors(
+    home_section: dict, active_sensors: dict
+) -> None:
+    """Raise HTTPException(422) if power monitoring is being enabled without
+    the phase-current sensors its phase_count requires.
+
+    Mirrors the frontend gating in HomeFormSection.tsx/SetupWizardPage.tsx —
+    this is the server-side backstop so the API itself refuses the invalid
+    combination regardless of which client called it.
+    """
+    if not home_section.get("power_monitoring_enabled"):
+        return
+    phase_count = home_section.get("phase_count", 3)
+    required_keys = (
+        ["current_l1"]
+        if phase_count == 1
+        else [
+            "current_l1",
+            "current_l2",
+            "current_l3",
+        ]
+    )
+    required_keys = [*required_keys, "battery_charging_power_rate"]
+    missing = [k for k in required_keys if not active_sensors.get(k)]
+    if missing:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "Cannot enable power monitoring: missing required sensor(s) "
+                f"for {phase_count}-phase: {', '.join(missing)}. "
+                "Configure them in Settings → Sensors first."
+            ),
+        )
+
+
+_CONSUMPTION_STRATEGIES = ("fixed", "sensor", "load_power_7d_avg", "ha_statistics")
+
+
+def _validate_consumption_strategy(home_section: dict, active_sensors: dict) -> None:
+    """Raise HTTPException(422) for a consumption strategy that cannot work.
+
+    Mirrors the frontend gating in HomeFormSection.tsx — the server-side
+    backstop so the API refuses the combination regardless of which client
+    called it. Only ``sensor`` is checked against its sensor: it is the one
+    strategy with no fallback, so without ``48h_avg_grid_import`` every
+    optimization run aborts, no schedule is ever built, and the dashboard
+    sits on "Initializing" forever (#558). ``ha_statistics`` and
+    ``load_power_7d_avg`` are left alone — they degrade to the fixed profile
+    and report it, rather than stalling.
+
+    The legacy id ``influxdb_7d_avg`` is accepted and normalised to
+    ``load_power_7d_avg`` so a persisted or client-supplied old value still
+    validates.
+    """
+    raw_strategy = home_section.get("consumption_strategy")
+    if raw_strategy is None:
+        return
+    strategy = canonicalize_consumption_strategy(raw_strategy)
+    if strategy not in _CONSUMPTION_STRATEGIES:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"Unknown consumption strategy '{strategy}'. Valid values: "
+                f"{', '.join(_CONSUMPTION_STRATEGIES)}."
+            ),
+        )
+    if strategy == "sensor" and not active_sensors.get("48h_avg_grid_import"):
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "Consumption strategy 'sensor' requires the "
+                "'48h_avg_grid_import' sensor, which is not configured. "
+                "Configure it in Settings → Sensors first, or choose a "
+                "strategy that does not need it."
+            ),
+        )
+
+
+def _validate_managed_load_sensors(home_section: dict) -> None:
+    """Raise HTTPException(422) if managed_load_sensors isn't a list of entity IDs.
+
+    ``sensors`` section values are validated against ``_ENTITY_ID_RE`` before
+    persisting (see the PATCH handler); managed_load_sensors lives in
+    ``home`` instead, since it is a list rather than a single sensor_key ->
+    entity_id mapping, so it needs the same check applied here.
+    """
+    sensors = home_section.get("managed_load_sensors")
+    if sensors is None:
+        return
+    if not isinstance(sensors, list):
+        raise HTTPException(
+            status_code=422,
+            detail="managed_load_sensors must be a list of entity IDs",
+        )
+    for entity_id in sensors:
+        if not isinstance(entity_id, str) or not _ENTITY_ID_RE.match(entity_id):
+            raise HTTPException(
+                status_code=422,
+                detail=f"Invalid entity ID format in managed_load_sensors: {entity_id!r}",
+            )
 
 
 def _require_configured_system(bess_controller) -> None:
@@ -189,6 +309,24 @@ async def get_settings():
         battery["reserved_capacity"] = battery["min_soe_kwh"]
         data["battery"] = battery
 
+        # Enrich the inverter section with the domain vendor service calls
+        # actually go to, so the UI can show the platform default as a
+        # placeholder without duplicating PLATFORM_SERVICE_DOMAIN client-side.
+        inverter = data.get("inverter", {})
+        inverter["resolved_service_domain"] = (
+            bess_controller.settings_store.get_service_domain()
+        )
+        data["inverter"] = inverter
+
+        # Deprecation nudge (#722): true while this install has real
+        # (non-placeholder) InfluxDB credentials configured — i.e. it actually
+        # relied on the InfluxDB read path. config.yaml ships the `influxdb`
+        # options block with placeholder creds for everyone, so mere presence
+        # of the block is not a useful signal; is_influxdb_configured() is.
+        # BESS no longer reads InfluxDB; the frontend shows a one-time banner
+        # pointing at the migration note. Removed with the option in PR 6.
+        data["influxdb_config_present"] = is_influxdb_configured()
+
         # Return the full per-platform sensors structure from the store.
         # Also include a flat "activeSensors" view for backwards compatibility.
         data.pop("sensors", None)
@@ -242,6 +380,16 @@ async def patch_settings(updates: dict):
                                 detail=f"Invalid entity ID format: {value!r}",
                             )
 
+            if store_key == "inverter":
+                domain = snake_data.get("service_domain")
+                if domain and not _HA_DOMAIN_RE.match(domain):
+                    raise HTTPException(
+                        status_code=422,
+                        detail=(
+                            f"Invalid Home Assistant integration domain: {domain!r}"
+                        ),
+                    )
+
             # Read-modify-write: merge into the existing section.
             # Use deep merge so that partial updates to nested sub-dicts (e.g.
             # nordpool_official.config_entry_id) do not erase sibling keys.
@@ -252,6 +400,29 @@ async def patch_settings(updates: dict):
             # zombie entries.  An empty string means "remove this sensor".
             if store_key == "sensors":
                 section = _strip_empty_sensor_values(section)
+
+            # Validate power-monitoring sensor requirements BEFORE persisting —
+            # must run ahead of save_section so an invalid combination is never
+            # written to disk, even though the client still gets a 422.
+            if store_key == "home":
+                effective_sensors = {
+                    **bess_controller.settings_store.get_active_sensors(),
+                    **flatten_sensors(updates.get("sensors") or {}),
+                }
+                _validate_power_monitoring_sensors(section, effective_sensors)
+                _validate_consumption_strategy(section, effective_sensors)
+                _validate_managed_load_sensors(section)
+
+            if store_key == "sensors":
+                # A sensor removal (e.g. unmapping a phase-current sensor) can
+                # break an already-enabled power-monitoring config just as
+                # much as an explicit disable-without-sensors on the home
+                # section can — validate against the persisted home config.
+                persisted_home = bess_controller.settings_store.get_section("home")
+                _validate_power_monitoring_sensors(
+                    persisted_home, flatten_sensors(section)
+                )
+                _validate_consumption_strategy(persisted_home, flatten_sensors(section))
 
             bess_controller.settings_store.save_section(store_key, section)
 
@@ -274,6 +445,8 @@ async def patch_settings(updates: dict):
                 # successor if a migration was ever interrupted (see
                 # HOME_MODEL_ATTRS's comment in api_conversion.py); passing it
                 # straight through would raise AttributeError.
+                # (Power-monitoring sensor validation already ran above, before
+                # save_section, so the invalid combination is never persisted.)
                 in_mem = {k: v for k, v in section.items() if k in _HOME_MODEL_ATTRS}
                 bess_controller.system.update_settings({"home": in_mem})
 
@@ -287,25 +460,22 @@ async def patch_settings(updates: dict):
                 bess_controller.system.update_settings({"energy_provider": section})
 
             elif store_key == "growatt":
+                # Platform switching lives in the "inverter" branch below;
+                # this section only carries the Growatt cloud device_id.
                 if "device_id" in section:
                     bess_controller.ha_controller.growatt_device_id = section[
                         "device_id"
                     ]
-                # Map legacy inverter_type to platform and switch controller
-                inverter_type = section.get("inverter_type")
-                if inverter_type:
-                    platform_map = bess_controller.system._INVERTER_TYPE_TO_PLATFORM
-                    if inverter_type not in platform_map:
-                        raise HTTPException(
-                            status_code=400,
-                            detail=f"Unknown inverter_type '{inverter_type}', "
-                            f"expected one of {list(platform_map)}",
-                        )
-                    bess_controller.system.switch_inverter_platform(
-                        platform_map[inverter_type]
-                    )
 
             elif store_key == "inverter":
+                # device_id here is the Huawei battery device (the Growatt
+                # cloud device_id lives in the growatt section above). Apply
+                # it live for the same reason that branch does — otherwise an
+                # edit in Settings only takes effect after a restart.
+                if "device_id" in section:
+                    bess_controller.ha_controller.huawei_device_id = section[
+                        "device_id"
+                    ]
                 platform = section.get("platform")
                 if platform:
                     bess_controller.system.switch_inverter_platform(platform)
@@ -329,9 +499,13 @@ async def patch_settings(updates: dict):
                 bess_controller.system.set_demo_mode(enabled)
 
         # Any of the sections above (sensors directly, or growatt/inverter via
-        # a platform switch) can change which sensors are active — refresh
-        # unconditionally rather than only on a "sensors" key match.
-        bess_controller.refresh_active_sensors()
+        # a platform switch) can change service_domain and the grid/battery
+        # signed-sensor polarities — refresh those unconditionally rather
+        # than only on a key match.
+        # ha_controller.sensors is a live settings_store view (#334) and
+        # needs no equivalent refresh.
+        bess_controller.refresh_service_domain()
+        bess_controller.refresh_power_polarities()
         _refresh_health(bess_controller)
         return await get_settings()
 
@@ -369,6 +543,15 @@ def _aggregate_quarterly_to_hourly(
         "IDLE": 1,
     }
 
+    def dominant_intent(intents: list[str]) -> str:
+        """Most common intent among the 4 quarters; ties broken by priority."""
+        intent_counts: dict[str, int] = {}
+        for intent_item in intents:
+            intent_counts[intent_item] = intent_counts.get(intent_item, 0) + 1
+        max_count = max(intent_counts.values())
+        candidates = [i for i, c in intent_counts.items() if c == max_count]
+        return max(candidates, key=lambda x: intent_priority.get(x, 0))
+
     hourly_periods = []
     num_hours = (len(quarterly_periods) + 3) // 4  # Round up to handle DST
 
@@ -386,20 +569,42 @@ def _aggregate_quarterly_to_hourly(
 
         # Determine dominant strategic intent (most common in the 4 periods)
         # If there's a tie, prioritize action over inaction
-        period_intents = [p.strategicIntent for p in quarter_periods]
-        intent_counts = {}
-        for intent_item in period_intents:
-            intent_counts[intent_item] = intent_counts.get(intent_item, 0) + 1
+        dominant_strategic_intent = dominant_intent(
+            [p.strategicIntent for p in quarter_periods]
+        )
 
-        # Find max count, then use priority as tie-breaker
-        max_count = max(intent_counts.values())
-        candidates = [i for i, c in intent_counts.items() if c == max_count]
-        dominant_intent = max(candidates, key=lambda x: intent_priority.get(x, 0))
+        # Curtailment (#501) is independent of intent -- a curtailed quarter
+        # can classify as SOLAR_STORAGE (battery still charging at its rate
+        # limit while the surplus above it curtails), so never filter by the
+        # dominant intent. If any quarter was curtailed, the hour as
+        # displayed is (at least partly) a curtailed export, not a purely
+        # profitable one.
+        hour_curtailed = any(p.curtailed for p in quarter_periods)
+
+        # Observed intent must aggregate across all 4 quarters too, not just
+        # the last one — a re-plan only updates strategicIntent going
+        # forward, so a stale strategicIntent can persist for an elapsed hour
+        # even though most/all of its quarters were genuinely observed
+        # executing something else (#486). dataSource itself stays tied to
+        # the last quarter (unchanged) — actualSavingsSoFar/predictedRemaining
+        # Savings (api_dataclasses.py) bucket a whole hour's summed
+        # hourlySavings by this field, so flipping it to "actual" as soon as
+        # any one quarter is actual would count still-predicted quarters'
+        # costs as realized.
+        actual_quarters = [p for p in quarter_periods if p.dataSource == "actual"]
+        observed_intents = [
+            p.observedIntent for p in actual_quarters if p.observedIntent
+        ]
+        hour_observed_intent = (
+            dominant_intent(observed_intents)
+            if observed_intents
+            else last_period.observedIntent
+        )
 
         # Sum energy values across the 4 quarters
         hourly_period = APIDashboardHourlyData(
             period=hour,
-            dataSource=last_period.dataSource,  # Use last period's data source
+            dataSource=last_period.dataSource,
             timestamp=last_period.timestamp,
             # Sum energy flows
             solarProduction=create_formatted_value(
@@ -550,8 +755,9 @@ def _aggregate_quarterly_to_hourly(
                 sum(p.netSavings.value for p in quarter_periods), "currency", currency
             ),
             # Use dominant strategic intent with tie-breaking (same logic as Growatt schedule)
-            strategicIntent=dominant_intent,
-            observedIntent=last_period.observedIntent,
+            strategicIntent=dominant_strategic_intent,
+            observedIntent=hour_observed_intent,
+            curtailed=hour_curtailed,
             directSolar=sum(p.directSolar for p in quarter_periods),
         )
 
@@ -564,8 +770,9 @@ def _aggregate_quarterly_to_hourly(
 async def get_dashboard_available_dates():
     """List ISO dates that have dashboard data available (for date-picker greying).
 
-    Today is always included even though it isn't persisted to the
-    DailyViewStore until day rollover.
+    Today is always included even though it is deliberately excluded from
+    DailyViewStore.list_available_dates() by design — today's view is
+    persisted continuously, but only past days are listed as history.
     """
     from app import bess_controller
 
@@ -849,646 +1056,6 @@ async def get_dashboard_data(
         raise HTTPException(status_code=500, detail=str(e)) from e
 
 
-############################################################################################
-# API Endpoints for Decision Insights
-############################################################################################
-
-
-def convert_real_data_to_mock_format(period_data_list, current_period, currency):
-    """
-    Convert real PeriodData with enhanced DecisionData to proper FormattedValue format.
-
-    Args:
-        period_data_list: List of PeriodData from DailyView (quarterly or hourly resolution)
-        current_period: Current period index for marking is_current_hour
-        currency: Currency code for formatting
-
-    Returns:
-        Dictionary with FormattedValue objects for proper frontend display
-    """
-    patterns = []
-
-    for period_data in period_data_list:
-        # Convert quarterly period (0-95) to hour (0-23) for display
-        period = period_data.period
-        hour = period // 4  # Quarterly to hourly conversion
-
-        energy = period_data.energy
-        economic = period_data.economic
-        decision = period_data.decision
-
-        # Determine if this is current period and actual vs predicted
-        is_current = period == current_period
-        is_actual = period_data.data_source == "actual"
-
-        # Create flows dictionary with FormattedValue objects
-        flows = {
-            "solar_to_home": create_formatted_value(
-                energy.solar_to_home, "energy_kwh_only", currency
-            ),
-            "solar_to_battery": create_formatted_value(
-                energy.solar_to_battery, "energy_kwh_only", currency
-            ),
-            "solar_to_grid": create_formatted_value(
-                energy.solar_to_grid, "energy_kwh_only", currency
-            ),
-            "grid_to_home": create_formatted_value(
-                energy.grid_to_home, "energy_kwh_only", currency
-            ),
-            "grid_to_battery": create_formatted_value(
-                energy.grid_to_battery, "energy_kwh_only", currency
-            ),
-            "battery_to_home": create_formatted_value(
-                energy.battery_to_home, "energy_kwh_only", currency
-            ),
-            "battery_to_grid": create_formatted_value(
-                energy.battery_to_grid, "energy_kwh_only", currency
-            ),
-        }
-
-        # Create immediate_flow_values using enhanced decision intelligence data
-        immediate_flow_values = {}
-
-        # Enhanced decision intelligence should always provide detailed flow values
-        # For historical data, detailed_flow_values might not be populated yet
-        if not decision.detailed_flow_values:
-            # Detailed flow values are only available for predicted periods;
-            # historical periods use an empty dict for now.
-            decision.detailed_flow_values = {}
-
-        # Use the advanced flow value calculations from decision intelligence
-        for flow_name, flow_value in decision.detailed_flow_values.items():
-            immediate_flow_values[flow_name] = create_formatted_value(
-                flow_value, "currency", currency
-            )
-
-        # Calculate immediate_total_value as sum of all flow values (extract numeric values)
-        total_value = sum(fv.value for fv in immediate_flow_values.values())
-        immediate_total_value = create_formatted_value(
-            total_value, "currency", currency
-        )
-
-        # Create future_opportunity with enhanced data
-        future_opportunity = {
-            "description": f"Future value realization from {decision.strategic_intent.lower().replace('_', ' ')} strategy",
-            "target_hours": (
-                decision.future_target_hours if decision.future_target_hours else []
-            ),
-            "expected_value": create_formatted_value(
-                decision.future_value or 0.0, "currency", currency
-            ),
-            "dependencies": [
-                "Price forecast accuracy",
-                "Battery state management",
-                "Solar production forecast",
-            ],
-        }
-
-        # Create the pattern object with enhanced decision intelligence fields
-        pattern = {
-            "hour": hour,
-            "pattern_name": decision.pattern_name
-            or f"{decision.strategic_intent} Strategy",
-            "flow_description": decision.description or "No significant energy flows",
-            "economic_context_description": f"Strategic intent: {decision.strategic_intent} - {decision.pattern_name or 'Standard operation'}",
-            "flows": flows,
-            "immediate_flow_values": immediate_flow_values,
-            "immediate_total_value": immediate_total_value,
-            "future_opportunity": future_opportunity,
-            "economic_chain": decision.economic_chain
-            or f"Hour {hour:02d}: No enhanced economic reasoning available",
-            "net_strategy_value": create_formatted_value(
-                decision.net_strategy_value or 0.0, "currency", currency
-            ),
-            "electricity_price": create_formatted_value(
-                economic.buy_price, "currency", currency
-            ),
-            "is_current_hour": is_current,
-            "is_actual": is_actual,
-            # Simple enhanced fields that actually work
-            "advanced_flow_pattern": decision.advanced_flow_pattern
-            or "NO_PATTERN_DETECTED",
-        }
-
-        patterns.append(pattern)
-
-    # Calculate summary statistics matching mock format
-    if patterns:
-        # Extract numeric values from FormattedValue objects before summing
-        total_net_value = sum(p["net_strategy_value"].value for p in patterns)
-        actual_patterns = [p for p in patterns if p["is_actual"]]
-        predicted_patterns = [p for p in patterns if not p["is_actual"]]
-        best_decision = max(patterns, key=lambda p: p["net_strategy_value"].value)
-
-        summary = {
-            "total_net_value": create_formatted_value(
-                total_net_value, "currency", currency
-            ),
-            "best_decision_hour": best_decision["hour"],
-            "best_decision_value": best_decision["net_strategy_value"],
-            "actual_hours_count": len(actual_patterns),
-            "predicted_hours_count": len(predicted_patterns),
-        }
-    else:
-        summary = {
-            "total_net_value": create_formatted_value(0.0, "currency", currency),
-            "best_decision_hour": 0,
-            "best_decision_value": create_formatted_value(0.0, "currency", currency),
-            "actual_hours_count": 0,
-            "predicted_hours_count": 0,
-        }
-
-    # Create response matching exact mock format
-    response = {"patterns": patterns, "summary": summary}
-
-    # Process future_opportunity objects for camelCase conversion (matching mock logic)
-    for pattern in patterns:
-        opportunity = pattern.get("future_opportunity")
-        if opportunity:
-            pattern["future_opportunity"] = {
-                "description": opportunity["description"],
-                "targetHours": opportunity["target_hours"],
-                "expectedValue": opportunity["expected_value"],
-                "dependencies": opportunity["dependencies"],
-            }
-
-    return response
-
-
-@router.get("/api/decision-intelligence")
-async def get_decision_intelligence():
-    """
-    Get decision intelligence data using real optimization results.
-    Converts real HourlyData to exact mock format for frontend compatibility.
-    """
-    from app import bess_controller
-
-    _require_configured_system(bess_controller)
-
-    try:
-        # Get the daily view with real optimization data (same as dashboard)
-        daily_view = bess_controller.system.get_current_daily_view()
-
-        # Get currency from settings
-        currency = bess_controller.system.home_settings.currency
-
-        # Calculate current period index (for quarterly resolution)
-        now = time_utils.now()
-        current_period = now.hour * 4 + now.minute // 15
-
-        # Convert real PeriodData to mock format
-        response = convert_real_data_to_mock_format(
-            daily_view.periods, current_period, currency
-        )
-
-        # Convert snake_case to camelCase for frontend (matching mock behavior)
-        return convert_keys_to_camel_case(response)
-
-    except Exception as e:
-        logger.warning(
-            f"Decision intelligence not available yet (insights page under construction): {e}"
-        )
-        # Return minimal empty response instead of crashing - insights page is under construction
-        return convert_keys_to_camel_case(
-            {
-                "hours": [],
-                "summary": {
-                    "total_battery_actions": 0,
-                    "charging_hours": 0,
-                    "discharging_hours": 0,
-                    "idle_hours": 0,
-                    "peak_charge_rate": 0.0,
-                    "peak_discharge_rate": 0.0,
-                },
-                "message": "Decision intelligence data not yet available - insights page under construction",
-            }
-        )
-
-
-# @router.get("/api/decision-intelligence")
-async def get_decision_intelligence_mock():
-    """
-    Get decision intelligence data with detailed flow patterns and economic reasoning.
-
-    Returns comprehensive energy flow analysis for each hour showing:
-    - Battery actions (charge/discharge decisions)
-    - Energy flow patterns between solar, grid, home, and battery
-    - Economic context and future opportunities
-    - Multi-hour strategy explanations
-    """
-    try:
-        current_hour = time_utils.now().hour
-        patterns = []
-
-        # Real historical prices from 2024-08-16 (extreme volatility day)
-        prices = [
-            0.9827,
-            0.8419,
-            0.0321,
-            0.0097,
-            0.0098,
-            0.9136,
-            1.4433,
-            1.5162,  # 00-07: High→Low→High
-            1.4029,
-            1.1346,
-            0.8558,
-            0.6485,
-            0.2895,
-            0.1363,
-            0.1253,
-            0.62,  # 08-15: Morning high, midday drop
-            0.888,
-            1.1662,
-            1.5163,
-            2.5908,
-            2.7325,
-            1.9312,
-            1.5121,
-            1.3056,  # 16-23: Evening extreme peak
-        ]
-
-        # Realistic solar pattern for summer day
-        solar = [
-            0.0,
-            0.0,
-            0.0,
-            0.0,
-            0.0,
-            0.0,
-            0.0,
-            0.8,  # 00-07: No solar
-            2.3,
-            3.7,
-            4.8,
-            5.5,
-            5.8,
-            5.8,
-            5.3,
-            4.4,  # 08-15: Solar ramp up to peak
-            3.3,
-            1.9,
-            0.9,
-            0.1,
-            0.0,
-            0.0,
-            0.0,
-            0.0,  # 16-23: Solar declining
-        ]
-
-        home_consumption = 5.2  # Constant consumption from test data
-
-        for hour in range(24):
-            price = prices[hour]
-            solar_production = solar[hour]
-            is_actual = hour < current_hour
-            is_current = hour == current_hour
-
-            if hour >= 0 and hour <= 4:
-                # Night/Early morning: Different strategies based on price extremes
-                if price < 0.05:
-                    # Ultra-cheap hours (03:00-04:00): Massive arbitrage opportunity
-                    pattern = {
-                        "hour": hour,
-                        "pattern_name": "GRID_TO_HOME_AND_BATTERY",
-                        "flow_description": "Grid 11.2kWh: 5.2kWh→Home, 6.0kWh→Battery",
-                        "economic_context_description": "Ultra-cheap electricity at 0.01 SEK/kWh - maximum charging for extreme evening arbitrage",
-                        "flows": {
-                            "solar_to_home": 0,
-                            "solar_to_battery": 0,
-                            "solar_to_grid": 0,
-                            "grid_to_home": home_consumption,
-                            "grid_to_battery": 6.0,
-                            "battery_to_home": 0,
-                            "battery_to_grid": 0,
-                        },
-                        "immediate_flow_values": {
-                            "grid_to_home": -home_consumption * price,
-                            "grid_to_battery": -6.0 * price,
-                        },
-                        "immediate_total_value": -(home_consumption + 6.0) * price,
-                        "future_opportunity": {
-                            "description": "Peak arbitrage during extreme evening prices at 2.73 SEK/kWh",
-                            "target_hours": [20, 21],
-                            "expected_value": 6.0 * 2.73,
-                            "dependencies": [
-                                "Battery capacity available",
-                                "Peak price realization",
-                                "No grid export limits",
-                            ],
-                        },
-                        "economic_chain": f"Hour {hour:02d}: Import 11.2kWh at ultra-cheap {price:.4f} SEK/kWh (-{((home_consumption + 6.0) * price):.2f} SEK) → Peak discharge 20:00-21:00 at 2.73 SEK/kWh (+{(6.0 * 2.73):.2f} SEK) → Net arbitrage profit: +{(6.0 * 2.73 - (home_consumption + 6.0) * price):.2f} SEK",
-                        "net_strategy_value": 6.0 * 2.73
-                        - (home_consumption + 6.0) * price,
-                        "electricity_price": price,
-                        "is_current_hour": is_current,
-                        "is_actual": is_actual,
-                    }
-                else:
-                    # Expensive night hours: Conservative operation
-                    pattern = {
-                        "hour": hour,
-                        "pattern_name": "GRID_TO_HOME",
-                        "flow_description": "Grid 5.2kWh→Home",
-                        "economic_context_description": "High night prices prevent arbitrage charging - wait for cheaper periods",
-                        "flows": {
-                            "solar_to_home": 0,
-                            "solar_to_battery": 0,
-                            "solar_to_grid": 0,
-                            "grid_to_home": home_consumption,
-                            "grid_to_battery": 0,
-                            "battery_to_home": 0,
-                            "battery_to_grid": 0,
-                        },
-                        "immediate_flow_values": {
-                            "grid_to_home": -home_consumption * price
-                        },
-                        "immediate_total_value": -home_consumption * price,
-                        "future_opportunity": {
-                            "description": "Wait for ultra-cheap periods at 03:00-04:00 for arbitrage charging",
-                            "target_hours": [3, 4],
-                            "expected_value": 0,
-                            "dependencies": ["Price drop realization"],
-                        },
-                        "economic_chain": f"Hour {hour:02d}: Standard consumption at {price:.2f} SEK/kWh (-{(home_consumption * price):.2f} SEK) → Avoid charging until ultra-cheap 03:00-04:00 periods",
-                        "net_strategy_value": -home_consumption * price,
-                        "electricity_price": price,
-                        "is_current_hour": is_current,
-                        "is_actual": is_actual,
-                    }
-            elif hour >= 5 and hour <= 7:
-                # Morning: Price rising, prepare for peak
-                pattern = {
-                    "hour": hour,
-                    "pattern_name": "GRID_TO_HOME_AND_BATTERY",
-                    "flow_description": "Grid 8.2kWh: 5.2kWh→Home, 3.0kWh→Battery",
-                    "economic_context_description": "Rising morning prices but still profitable vs extreme evening peak - final charging window",
-                    "flows": {
-                        "solar_to_home": 0,
-                        "solar_to_battery": 0,
-                        "solar_to_grid": 0,
-                        "grid_to_home": home_consumption,
-                        "grid_to_battery": 3.0,
-                        "battery_to_home": 0,
-                        "battery_to_grid": 0,
-                    },
-                    "immediate_flow_values": {
-                        "grid_to_home": -home_consumption * price,
-                        "grid_to_battery": -3.0 * price,
-                    },
-                    "immediate_total_value": -(home_consumption + 3.0) * price,
-                    "future_opportunity": {
-                        "description": "Evening arbitrage at 2.59-2.73 SEK/kWh peak",
-                        "target_hours": [19, 20, 21],
-                        "expected_value": 3.0 * 2.6,
-                        "dependencies": [
-                            "Evening peak price accuracy",
-                            "Battery availability",
-                        ],
-                    },
-                    "economic_chain": f"Hour {hour:02d}: Import 8.2kWh at {price:.2f} SEK/kWh (-{((home_consumption + 3.0) * price):.2f} SEK) → Evening peak discharge at 2.60 SEK/kWh (+{(3.0 * 2.6):.2f} SEK) → Net profit: +{(3.0 * 2.6 - (home_consumption + 3.0) * price):.2f} SEK",
-                    "net_strategy_value": 3.0 * 2.6 - (home_consumption + 3.0) * price,
-                    "electricity_price": price,
-                    "is_current_hour": is_current,
-                    "is_actual": is_actual,
-                }
-            elif hour >= 8 and hour <= 15:
-                # Daytime: Solar available, complex optimization
-                if solar_production > home_consumption:
-                    # Excess solar available
-                    pattern = {
-                        "hour": hour,
-                        "pattern_name": "SOLAR_TO_HOME_AND_BATTERY_AND_GRID",
-                        "flow_description": f"Solar {solar_production:.1f}kWh: {home_consumption:.1f}kWh→Home, {min(2.5, solar_production - home_consumption):.1f}kWh→Battery, {max(0, solar_production - home_consumption - 2.5):.1f}kWh→Grid",
-                        "economic_context_description": "Peak solar optimally distributed - prioritize battery storage over immediate export for evening arbitrage",
-                        "flows": {
-                            "solar_to_home": home_consumption,
-                            "solar_to_battery": min(
-                                2.5, solar_production - home_consumption
-                            ),
-                            "solar_to_grid": max(
-                                0, solar_production - home_consumption - 2.5
-                            ),
-                            "grid_to_home": 0,
-                            "grid_to_battery": 0,
-                            "battery_to_home": 0,
-                            "battery_to_grid": 0,
-                        },
-                        "immediate_flow_values": {
-                            "solar_to_home": home_consumption * price,
-                            "solar_to_battery": 0,
-                            "solar_to_grid": max(
-                                0, solar_production - home_consumption - 2.5
-                            )
-                            * 0.08,
-                        },
-                        "immediate_total_value": home_consumption * price
-                        + max(0, solar_production - home_consumption - 2.5) * 0.08,
-                        "future_opportunity": {
-                            "description": "Stored solar enables evening peak arbitrage worth 2.59 SEK/kWh",
-                            "target_hours": [19, 20, 21],
-                            "expected_value": min(
-                                2.5, solar_production - home_consumption
-                            )
-                            * 2.59,
-                            "dependencies": [
-                                "Evening peak prices",
-                                "Battery SOC management",
-                                "Home consumption accuracy",
-                            ],
-                        },
-                        "economic_chain": f"Hour {hour:02d}: Solar saves {(home_consumption * price):.2f} SEK + export {(max(0, solar_production - home_consumption - 2.5) * 0.08):.2f} SEK → Stored solar discharge 19:00-21:00 at 2.59 SEK/kWh (+{(min(2.5, solar_production - home_consumption) * 2.59):.2f} SEK) → Total value: +{(home_consumption * price + max(0, solar_production - home_consumption - 2.5) * 0.08 + min(2.5, solar_production - home_consumption) * 2.59):.2f} SEK",
-                        "net_strategy_value": home_consumption * price
-                        + max(0, solar_production - home_consumption - 2.5) * 0.08
-                        + min(2.5, solar_production - home_consumption) * 2.59,
-                        "electricity_price": price,
-                        "is_current_hour": is_current,
-                        "is_actual": is_actual,
-                    }
-                else:
-                    # Insufficient solar
-                    pattern = {
-                        "hour": hour,
-                        "pattern_name": "SOLAR_TO_HOME_PLUS_GRID_TO_HOME",
-                        "flow_description": f"Solar {solar_production:.1f}kWh→Home, Grid {(home_consumption - solar_production):.1f}kWh→Home",
-                        "economic_context_description": "Partial solar coverage - grid supplement needed but avoid charging during moderate prices",
-                        "flows": {
-                            "solar_to_home": solar_production,
-                            "solar_to_battery": 0,
-                            "solar_to_grid": 0,
-                            "grid_to_home": home_consumption - solar_production,
-                            "grid_to_battery": 0,
-                            "battery_to_home": 0,
-                            "battery_to_grid": 0,
-                        },
-                        "immediate_flow_values": {
-                            "solar_to_home": solar_production * price,
-                            "grid_to_home": -(home_consumption - solar_production)
-                            * price,
-                        },
-                        "immediate_total_value": solar_production * price
-                        - (home_consumption - solar_production) * price,
-                        "future_opportunity": {
-                            "description": "Wait for evening peak to discharge stored energy from night charging",
-                            "target_hours": [19, 20, 21],
-                            "expected_value": 0,
-                            "dependencies": [
-                                "Previously stored battery energy availability"
-                            ],
-                        },
-                        "economic_chain": f"Hour {hour:02d}: Solar saves {(solar_production * price):.2f} SEK, Grid costs {((home_consumption - solar_production) * price):.2f} SEK → Net: {(solar_production * price - (home_consumption - solar_production) * price):.2f} SEK",
-                        "net_strategy_value": solar_production * price
-                        - (home_consumption - solar_production) * price,
-                        "electricity_price": price,
-                        "is_current_hour": is_current,
-                        "is_actual": is_actual,
-                    }
-            elif hour >= 16 and hour <= 18:
-                # Early evening: Price rising, transition strategy
-                pattern = {
-                    "hour": hour,
-                    "pattern_name": "SOLAR_TO_HOME_PLUS_BATTERY_TO_HOME",
-                    "flow_description": f"Solar {solar_production:.1f}kWh→Home, Battery {max(0, home_consumption - solar_production):.1f}kWh→Home",
-                    "economic_context_description": "Rising prices trigger battery discharge - preserve remaining charge for extreme peak hours",
-                    "flows": {
-                        "solar_to_home": min(solar_production, home_consumption),
-                        "solar_to_battery": 0,
-                        "solar_to_grid": 0,
-                        "grid_to_home": 0,
-                        "grid_to_battery": 0,
-                        "battery_to_home": max(0, home_consumption - solar_production),
-                        "battery_to_grid": 0,
-                    },
-                    "immediate_flow_values": {
-                        "solar_to_home": min(solar_production, home_consumption)
-                        * price,
-                        "battery_to_home": max(0, home_consumption - solar_production)
-                        * price,
-                    },
-                    "immediate_total_value": home_consumption * price,
-                    "future_opportunity": {
-                        "description": "Preserve remaining battery charge for extreme peak at 2.73 SEK/kWh",
-                        "target_hours": [20, 21],
-                        "expected_value": 3.0 * 2.73,
-                        "dependencies": [
-                            "Peak price realization",
-                            "Battery SOC sufficient",
-                        ],
-                    },
-                    "economic_chain": f"Hour {hour:02d}: Avoid grid at {price:.2f} SEK/kWh (+{(home_consumption * price):.2f} SEK saved) → Reserve charge for 20:00-21:00 peak at 2.73 SEK/kWh (+{(3.0 * 2.73):.2f} SEK potential)",
-                    "net_strategy_value": home_consumption * price + 3.0 * 2.73,
-                    "electricity_price": price,
-                    "is_current_hour": is_current,
-                    "is_actual": is_actual,
-                }
-            elif hour >= 19 and hour <= 21:
-                # Peak hours: Maximum arbitrage execution
-                pattern = {
-                    "hour": hour,
-                    "pattern_name": "BATTERY_TO_HOME_AND_GRID",
-                    "flow_description": "Battery 6.0kWh: 5.2kWh→Home, 0.8kWh→Grid",
-                    "economic_context_description": "Extreme peak prices - full arbitrage execution with both home supply and grid export",
-                    "flows": {
-                        "solar_to_home": 0,
-                        "solar_to_battery": 0,
-                        "solar_to_grid": 0,
-                        "grid_to_home": 0,
-                        "grid_to_battery": 0,
-                        "battery_to_home": home_consumption,
-                        "battery_to_grid": 0.8,
-                    },
-                    "immediate_flow_values": {
-                        "battery_to_home": home_consumption * price,
-                        "battery_to_grid": 0.8 * 0.08,
-                    },
-                    "immediate_total_value": home_consumption * price + 0.8 * 0.08,
-                    "future_opportunity": {
-                        "description": "Peak arbitrage strategy execution - realizing value from night charging at 0.01 SEK/kWh",
-                        "target_hours": [],
-                        "expected_value": 0,
-                        "dependencies": [],
-                    },
-                    "economic_chain": f"Hour {hour:02d}: Battery arbitrage execution (+{(home_consumption * price + 0.8 * 0.08):.2f} SEK) ← Sourced from ultra-cheap night charging at 0.01 SEK/kWh → Net arbitrage profit: +{((home_consumption + 0.8) * price - (home_consumption + 0.8) * 0.01):.2f} SEK",
-                    "net_strategy_value": (home_consumption + 0.8) * price
-                    - (home_consumption + 0.8) * 0.01,
-                    "electricity_price": price,
-                    "is_current_hour": is_current,
-                    "is_actual": is_actual,
-                }
-            else:
-                # Late evening: Post-peak wind down
-                pattern = {
-                    "hour": hour,
-                    "pattern_name": "BATTERY_TO_HOME",
-                    "flow_description": "Battery 5.2kWh→Home",
-                    "economic_context_description": "Post-peak period - continue battery discharge while prices remain elevated above charging cost",
-                    "flows": {
-                        "solar_to_home": 0,
-                        "solar_to_battery": 0,
-                        "solar_to_grid": 0,
-                        "grid_to_home": 0,
-                        "grid_to_battery": 0,
-                        "battery_to_home": home_consumption,
-                        "battery_to_grid": 0,
-                    },
-                    "immediate_flow_values": {
-                        "battery_to_home": home_consumption * price
-                    },
-                    "immediate_total_value": home_consumption * price,
-                    "future_opportunity": {
-                        "description": "Continue arbitrage until prices drop below charging costs - prepare for next cycle",
-                        "target_hours": [],
-                        "expected_value": 0,
-                        "dependencies": [
-                            "Next day price forecast",
-                            "Battery SOC management",
-                        ],
-                    },
-                    "economic_chain": f"Hour {hour:02d}: Continue discharge at {price:.2f} SEK/kWh (+{(home_consumption * price):.2f} SEK) ← Sourced from 0.01 SEK/kWh charging → Arbitrage profit: +{(home_consumption * (price - 0.01)):.2f} SEK",
-                    "net_strategy_value": home_consumption * (price - 0.01),
-                    "electricity_price": price,
-                    "is_current_hour": is_current,
-                    "is_actual": is_actual,
-                }
-
-            patterns.append(pattern)
-
-        # Calculate summary statistics
-        total_net_value = sum(p["net_strategy_value"] for p in patterns)
-        actual_patterns = [p for p in patterns if p["is_actual"]]
-        predicted_patterns = [p for p in patterns if not p["is_actual"]]
-        best_decision = max(patterns, key=lambda p: p["net_strategy_value"])
-
-        response = {
-            "patterns": patterns,
-            "summary": {
-                "total_net_value": total_net_value,
-                "best_decision_hour": best_decision["hour"],
-                "best_decision_value": best_decision["net_strategy_value"],
-                "actual_hours_count": len(actual_patterns),
-                "predicted_hours_count": len(predicted_patterns),
-            },
-        }
-
-        # Deep conversion for future_opportunity objects
-        for pattern in patterns:
-            opportunity = pattern.get("future_opportunity")
-            if opportunity:
-                pattern["future_opportunity"] = {
-                    "description": opportunity["description"],
-                    "targetHours": opportunity["target_hours"],
-                    "expectedValue": opportunity["expected_value"],
-                    "dependencies": opportunity["dependencies"],
-                }
-
-        # Convert all other snake_case to camelCase
-        return convert_keys_to_camel_case(response)
-
-    except Exception as e:
-        logger.error(f"Error generating decision intelligence data: {e}")
-        raise HTTPException(status_code=500, detail=str(e)) from e
-
-
 # Canonical inverter endpoints (/api/inverter/*) plus legacy /api/growatt/* aliases
 @router.get("/api/inverter/status")
 @router.get("/api/growatt/inverter_status")
@@ -1515,14 +1082,24 @@ async def get_inverter_status():
 
         battery_settings = bess_controller.system.battery_settings
 
-        # Get current battery mode from schedule for current hour
-        current_battery_mode = "load_first"  # Default
+        # Get current battery mode from schedule for current hour. Only
+        # tou_register controllers actually have a batt_mode register;
+        # vpp_power controllers surface vpp_power_pct/vpp_remote_control
+        # instead, and period_list controllers have neither -- mirrors
+        # _mode_display_fields()'s contract (see get_period_settings()).
+        current_mode_fields: dict = {}
         try:
             now = time_utils.now()
             schedule_manager = bess_controller.system._inverter_controller
             current_period = now.hour * 4 + now.minute // 15
             period_settings = schedule_manager.get_period_settings(current_period)
-            current_battery_mode = period_settings.get("batt_mode", "load_first")
+            if "batt_mode" in period_settings:
+                current_mode_fields = {"battery_mode": period_settings["batt_mode"]}
+            elif "vpp_power_pct" in period_settings:
+                current_mode_fields = {
+                    "vpp_power_pct": period_settings["vpp_power_pct"],
+                    "vpp_remote_control": period_settings["vpp_remote_control"],
+                }
         except Exception as e:
             logger.warning(f"Failed to get current battery mode: {e}")
 
@@ -1537,13 +1114,14 @@ async def get_inverter_status():
         battery_discharge_power = controller.get_battery_discharge_power()
 
         inverter_platform = bess_controller.system.inverter_platform
+        control_model = schedule_manager.CONTROL_MODEL
 
         response = {
             "battery_soc": battery_soc,
             "battery_soe": battery_soe,
             "battery_charge_power": battery_charge_power,
             "battery_discharge_power": battery_discharge_power,
-            "battery_mode": current_battery_mode,
+            **current_mode_fields,
             "grid_charge_enabled": grid_charge_enabled,
             "charge_stop_soc": battery_settings.max_soc,
             "discharge_stop_soc": battery_settings.min_soc,
@@ -1551,6 +1129,7 @@ async def get_inverter_status():
             "discharge_power_rate": discharge_power_rate,
             "discharge_inhibit_active": controller.get_discharge_inhibit_active(),
             "inverter_platform": inverter_platform,
+            "control_model": control_model,
             "timestamp": datetime.now().isoformat(),
         }
 
@@ -1572,6 +1151,7 @@ async def get_growatt_detailed_schedule():
 
     try:
         schedule_manager = bess_controller.system._inverter_controller
+        control_model = schedule_manager.CONTROL_MODEL
         battery_settings = bess_controller.system.battery_settings
         current_hour = time_utils.now().hour
 
@@ -1604,10 +1184,11 @@ async def get_growatt_detailed_schedule():
                 hourly_settings = _get_hourly_settings_from_periods(
                     schedule_manager, hour
                 )
-                battery_mode = hourly_settings.get("batt_mode", "load_first")
-                mode_distribution[battery_mode] = (
-                    mode_distribution.get(battery_mode, 0) + 1
-                )
+                battery_mode = hourly_settings.get("batt_mode")
+                if battery_mode is not None:
+                    mode_distribution[battery_mode] = (
+                        mode_distribution.get(battery_mode, 0) + 1
+                    )
 
                 strategic_intent = hourly_settings.get("strategic_intent", "IDLE")
 
@@ -1644,8 +1225,21 @@ async def get_growatt_detailed_schedule():
                     {
                         "hour": hour,
                         "mode": "idle",
-                        "batt_mode": battery_mode,
-                        "batteryMode": battery_mode,
+                        **(
+                            {"batt_mode": battery_mode, "batteryMode": battery_mode}
+                            if battery_mode is not None
+                            else {}
+                        ),
+                        **(
+                            {
+                                "vpp_power_pct": hourly_settings["vpp_power_pct"],
+                                "vpp_remote_control": hourly_settings[
+                                    "vpp_remote_control"
+                                ],
+                            }
+                            if "vpp_power_pct" in hourly_settings
+                            else {}
+                        ),
                         "grid_charge": hourly_settings.get("grid_charge", False),
                         "discharge_rate": hourly_settings.get("discharge_rate", 100),
                         "dischargePowerRate": hourly_settings.get(
@@ -1675,8 +1269,14 @@ async def get_growatt_detailed_schedule():
                     {
                         "hour": hour,
                         "mode": "idle",
-                        "batt_mode": "load_first",
-                        "batteryMode": "load_first",  # Add alias for frontend compatibility
+                        **(
+                            {
+                                "batt_mode": "load_first",
+                                "batteryMode": "load_first",  # Add alias for frontend compatibility
+                            }
+                            if control_model == "tou_register"
+                            else {}
+                        ),
                         "grid_charge": False,
                         "discharge_rate": 100,
                         "dischargePowerRate": 100,  # Add alias
@@ -1703,6 +1303,7 @@ async def get_growatt_detailed_schedule():
         try:
             today_soc_values: list[float | None] = []
             today_actions: list[float] = []
+            today_curtailed: list[bool] = []
             today_reconciled_intents: list[str] | None = None
             if bess_controller.system.schedule_store.get_latest_schedule():
                 today_period_count_local = get_period_count(time_utils.today())
@@ -1738,14 +1339,17 @@ async def get_growatt_detailed_schedule():
                             if pd_today.data_source == "actual" and observed_intent
                             else planned_intent
                         )
+                        today_curtailed.append(pd_today.decision.curtailed)
                     else:
                         today_soc_values.append(None)
                         today_actions.append(0.0)
                         today_reconciled_intents.append(planned_intent)
+                        today_curtailed.append(False)
             raw_groups = schedule_manager.get_detailed_period_groups(
                 intents=today_reconciled_intents,
                 actions=today_actions if today_actions else None,
                 soc_values=today_soc_values if today_soc_values else None,
+                curtailed=today_curtailed if today_curtailed else None,
             )
             prev_soc: float | None = None
             for group in raw_groups:
@@ -1764,7 +1368,18 @@ async def get_growatt_detailed_schedule():
                     {
                         "start_time": group["start_time"],
                         "end_time": group["end_time"],
-                        "mode": group["mode"],
+                        **(
+                            {
+                                "vpp_power_pct": group["vpp_power_pct"],
+                                "vpp_remote_control": group["vpp_remote_control"],
+                            }
+                            if "vpp_power_pct" in group
+                            else (
+                                {"batt_mode": group["batt_mode"]}
+                                if "batt_mode" in group
+                                else {}
+                            )
+                        ),
                         "dominant_intent": group["intent"],
                         "intent_counts": {group["intent"]: group["period_count"]},
                         "period_count": group["period_count"],
@@ -1775,6 +1390,7 @@ async def get_growatt_detailed_schedule():
                         "total_action_kwh": group["total_action_kwh"],
                         "soc_end_pct": soc_end,
                         "soc_delta_kwh": soc_delta_kwh,
+                        "curtailed": group["curtailed"],
                     }
                 )
         except (ValueError, KeyError, AttributeError) as e:
@@ -1791,6 +1407,7 @@ async def get_growatt_detailed_schedule():
                 tomorrow_intents: list[str] = []
                 tomorrow_actions: list[float] = []
                 tomorrow_soc_values: list[float | None] = []
+                tomorrow_curtailed: list[bool] = []
                 # Resolved by exact timestamp (not positional index -
                 # optimization_period) so a standalone next-day schedule
                 # (period_data[0] anchored to tomorrow 00:00 despite
@@ -1812,13 +1429,16 @@ async def get_growatt_detailed_schedule():
                             if battery_settings.total_capacity > 0
                             else None
                         )
+                        tomorrow_curtailed.append(pd.decision.curtailed)
                     else:
                         tomorrow_soc_values.append(None)
+                        tomorrow_curtailed.append(False)
                 if tomorrow_intents:
                     raw_tomorrow_groups = schedule_manager.get_detailed_period_groups(
                         intents=tomorrow_intents,
                         actions=tomorrow_actions,
                         soc_values=tomorrow_soc_values,
+                        curtailed=tomorrow_curtailed,
                     )
                     tomorrow_period_groups = []
                     prev_soc_tmr: float | None = None
@@ -1840,7 +1460,20 @@ async def get_growatt_detailed_schedule():
                             {
                                 "start_time": group["start_time"],
                                 "end_time": group["end_time"],
-                                "mode": group["mode"],
+                                **(
+                                    {
+                                        "vpp_power_pct": group["vpp_power_pct"],
+                                        "vpp_remote_control": group[
+                                            "vpp_remote_control"
+                                        ],
+                                    }
+                                    if "vpp_power_pct" in group
+                                    else (
+                                        {"batt_mode": group["batt_mode"]}
+                                        if "batt_mode" in group
+                                        else {}
+                                    )
+                                ),
                                 "dominant_intent": group["intent"],
                                 "intent_counts": {
                                     group["intent"]: group["period_count"]
@@ -1853,6 +1486,7 @@ async def get_growatt_detailed_schedule():
                                 "total_action_kwh": group["total_action_kwh"],
                                 "soc_end_pct": soc_end,
                                 "soc_delta_kwh": soc_delta_kwh_tmr,
+                                "curtailed": group["curtailed"],
                             }
                         )
         except (AttributeError, KeyError, ValueError) as e:
@@ -1864,6 +1498,7 @@ async def get_growatt_detailed_schedule():
         response = {
             "current_hour": current_hour,
             "inverter_platform": inverter_platform,
+            "control_model": control_model,
             "tou_intervals": tou_intervals,
             "schedule_data": schedule_data,
             "period_groups": period_groups,
@@ -2073,6 +1708,24 @@ async def recheck_system_health():
         raise HTTPException(status_code=500, detail=str(e)) from e
 
 
+def _device_maps_from(controller: Any) -> tuple[dict, dict]:
+    """Resolve HA entity/device registry maps for banner grouping.
+
+    A registry query failure is a data outage, not a banner outage: the
+    banner must still report the critical failure, so degrade to empty maps
+    (component-name grouping) and log it rather than drop the banner.
+    """
+    try:
+        entity_to_device, device_names = controller.get_device_maps()
+        return entity_to_device, device_names
+    except SystemConfigurationError as e:
+        logger.warning(
+            "HA device registry unavailable, grouping banner by component name: %s",
+            e,
+        )
+        return {}, {}
+
+
 @router.get("/api/dashboard-health-summary")
 async def get_dashboard_health_summary():
     """Get lightweight health summary for dashboard alert banner - only critical issues."""
@@ -2107,17 +1760,27 @@ async def get_dashboard_health_summary():
                 component.get("name"): component
                 for component in cached_results.get("checks", [])
             }
-            critical_issues = []
-            for failure in critical_failures:
-                component = components_by_name.get(failure, {})
-                critical_issues.append(
-                    {
-                        "component": failure,
-                        "description": "Critical sensor configuration issue detected",
-                        "detail": describe_failing_checks(component),
-                        "status": "ERROR",
-                    }
+            # One device outage fails several components at once (Battery
+            # Control, Battery Monitoring, ...) — show ONE banner line per
+            # underlying device, not one per component.
+            failing_components = [
+                components_by_name.get(failure) or {"name": failure, "status": "ERROR"}
+                for failure in critical_failures
+            ]
+            entity_to_device, device_names = _device_maps_from(
+                bess_controller.ha_controller
+            )
+            critical_issues = [
+                {
+                    "component": group["device"],
+                    "description": "Critical sensor configuration issue detected",
+                    "detail": ", ".join(group["component_names"]),
+                    "status": "ERROR",
+                }
+                for group in group_components_by_device(
+                    failing_components, entity_to_device, device_names
                 )
+            ]
 
             summary = {
                 "has_critical_errors": True,
@@ -2148,35 +1811,43 @@ async def get_dashboard_health_summary():
                 }
                 return convert_keys_to_camel_case(summary)
 
-            # Extract critical and warning information
+            # Extract critical and warning information, grouped per device so
+            # one device outage shows as one banner line. has_critical_error is
+            # decided before grouping, from the raw components: it must stay
+            # true whenever a REQUIRED component is in ERROR, even if that
+            # component shares its device with optional WARNING-only ones.
+            non_ok = [
+                component
+                for component in health_results.get("checks", [])
+                if component.get("status") in ("WARNING", "ERROR")
+            ]
+            has_critical_error = any(
+                component.get("required") and component.get("status") == "ERROR"
+                for component in non_ok
+            )
+            entities_by_name = {
+                component.get("name"): component for component in non_ok
+            }
+            entity_to_device, device_names = _device_maps_from(
+                bess_controller.ha_controller
+            )
             critical_issues = []
-            has_critical_error = False
-
-            for component in health_results.get("checks", []):
-                status = component.get("status", "UNKNOWN")
-                is_required = component.get("required", False)
-
-                # Show required components with ERROR status as critical
-                if is_required and status == "ERROR":
-                    has_critical_error = True
-                    critical_issues.append(
-                        {
-                            "component": component.get("name", "Unknown"),
-                            "description": component.get("description", ""),
-                            "detail": describe_failing_checks(component),
-                            "status": status,
-                        }
-                    )
-                # Show all components (required or not) with WARNING or ERROR status
-                elif status in ["WARNING", "ERROR"]:
-                    critical_issues.append(
-                        {
-                            "component": component.get("name", "Unknown"),
-                            "description": component.get("description", ""),
-                            "detail": describe_failing_checks(component),
-                            "status": status,
-                        }
-                    )
+            for group in group_components_by_device(
+                non_ok, entity_to_device, device_names
+            ):
+                members = [entities_by_name[n] for n in group["component_names"]]
+                critical_issues.append(
+                    {
+                        "component": group["device"],
+                        "description": members[0].get("description", ""),
+                        "detail": ", ".join(group["component_names"]),
+                        "status": (
+                            "ERROR"
+                            if any(s == "ERROR" for s in group["statuses"])
+                            else "WARNING"
+                        ),
+                    }
+                )
 
             has_warnings = any(
                 issue["status"] == "WARNING" for issue in critical_issues
@@ -2404,11 +2075,16 @@ async def get_savings_aggregate(
         resolved_count = count or DEFAULT_COUNTS[period]
 
         today_view = None
-        if period == "day" and target_date == time_utils.today():
+        if (
+            period == "day"
+            and target_date == time_utils.today()
+            and target_date.isoformat()
+            not in bess_controller.system.daily_view_store.list_available_dates()
+        ):
             now = time_utils.now()
             current_period = now.hour * 4 + now.minute // 15
             today_view = bess_controller.system.daily_view_builder.build_daily_view(
-                current_period
+                current_period, bess_controller.system.export_curtailment_active
             )
 
         buckets = build_buckets(
@@ -2498,7 +2174,7 @@ async def get_prediction_comparison(
 
         # Build current daily view
         current_daily_view = bess_controller.system.daily_view_builder.build_daily_view(
-            current_period
+            current_period, bess_controller.system.export_curtailment_active
         )
 
         # Get current Growatt schedule
@@ -2727,6 +2403,16 @@ async def compare_two_snapshots(
             }
             period_comparisons.append(comparison)
 
+        def _interval_display_fields(interval: dict) -> dict:
+            if "vpp_power_pct" in interval:
+                return {
+                    "vpp_power_pct": interval["vpp_power_pct"],
+                    "vpp_remote_control": interval["vpp_remote_control"],
+                }
+            if "batt_mode" in interval:
+                return {"batt_mode": interval["batt_mode"]}
+            return {}
+
         # Build response
         response = {
             "snapshotAPeriod": period_a,
@@ -2737,7 +2423,7 @@ async def compare_two_snapshots(
             "growattScheduleA": [
                 {
                     "segmentId": i + 1,
-                    "battMode": interval["batt_mode"],
+                    **_interval_display_fields(interval),
                     "startTime": interval["start_time"],
                     "endTime": interval["end_time"],
                     "enabled": interval.get("enabled", True),
@@ -2747,7 +2433,7 @@ async def compare_two_snapshots(
             "growattScheduleB": [
                 {
                     "segmentId": i + 1,
-                    "battMode": interval["batt_mode"],
+                    **_interval_display_fields(interval),
                     "startTime": interval["start_time"],
                     "endTime": interval["end_time"],
                     "enabled": interval.get("enabled", True),
@@ -3197,14 +2883,19 @@ def _pricing_defaults_for_discovery(integrations: dict) -> dict:
 async def run_setup_discovery():
     """Run auto-discovery of inverter and pricing integrations.
 
-    Uses the HA entity registry (platform field) for robust integration
-    detection, then maps entity suffixes to BESS sensor keys.  When the
-    entity registry is unavailable (e.g. older HA Core versions without
-    WebSocket support), uses states-based prefix matching instead.
+    Inverter platforms are detected from the HA entity registry alone —
+    the ``platform`` field to identify the integration, then ``unique_id``
+    suffixes to map its entities onto BESS sensor keys.  Neither changes
+    when a user renames an entity, so there is no entity_id pattern
+    matching in this path.
+
+    ``/api/states`` is still read, but only for things the registry does
+    not carry: the HACS Nordpool area, Octopus/ENTSO-e price entities, and
+    phase-current sensors.
 
     Returns:
         dict: Discovery results including found sensors, missing sensors, and
-              integration metadata (device_sn, nordpool_area)
+              integration metadata (nordpool_area)
     """
     from app import bess_controller
 
@@ -3279,9 +2970,13 @@ async def run_setup_discovery():
 
         # Registry-based discovery (robust against entity renaming)
         registry = ha.fetch_entity_registry()
-        platform_sensors, detected_platform = ha.discover_sensors_from_registry(
-            registry
-        )
+        (
+            platform_sensors,
+            detected_platform,
+            platform_disabled,
+        ) = ha.discover_sensors_from_registry(registry)
+        disabled_sensors: dict[str, str] = {}
+        platform_disabled_sensors: dict[str, dict[str, str]] = platform_disabled
         if platform_sensors:
             # When local modbus is detected alongside cloud, use modbus as
             # the primary sensor source (it provides TOU control entities).
@@ -3299,6 +2994,7 @@ async def run_setup_discovery():
             ):
                 effective_platform = "solax_modbus_growatt_sph"
             sensors = dict(platform_sensors.get(effective_platform, {}))
+            disabled_sensors = dict(platform_disabled.get(effective_platform, {}))
             _suffix_maps = {
                 "growatt_server_min": ha.GROWATT_MIN_SUFFIX_MAP,
                 "growatt_server_sph": ha.GROWATT_SPH_SUFFIX_MAP,
@@ -3315,7 +3011,14 @@ async def run_setup_discovery():
                     for k in all_bess_keys
                     if not (k.startswith("tou_time_") and k[9:10] in "23456789")
                 ]
-            missing_sensors = [k for k in all_bess_keys if k not in sensors]
+            # A disabled sensor is not "missing" — the entity exists and the
+            # user only has to switch it on.  Keep the two conditions apart
+            # so the wizard can give the actionable message (#549).
+            missing_sensors = [
+                k
+                for k in all_bess_keys
+                if k not in sensors and k not in disabled_sensors
+            ]
 
         current_sensors = ha.discover_current_sensors(states)
         for phase_key, entity_id in current_sensors.items():
@@ -3340,8 +3043,8 @@ async def run_setup_discovery():
         result = convert_keys_to_camel_case(
             {
                 "growatt_found": integrations["growatt_found"],
-                "device_sn": integrations["device_sn"],
                 "growatt_device_id": integrations["growatt_device_id"],
+                "huawei_found": integrations["huawei_found"],
                 "huawei_device_id": integrations.get("huawei_device_id"),
                 "solax_found": integrations["solax_found"],
                 "solax_has_growatt_tou": integrations.get(
@@ -3372,6 +3075,14 @@ async def run_setup_discovery():
         # Attach sensor dicts without key conversion
         result["sensors"] = sensors
         result["platformSensors"] = platform_sensors
+        # Sensor keys left unmapped because their only registry match is
+        # disabled in HA — the wizard blocks on these and names the entity
+        # to enable, rather than persisting a mapping that 404s (#549).
+        # Per-platform like platformSensors, because the user can switch the
+        # inverter tab away from the auto-detected platform and the gate has
+        # to follow that choice.
+        result["disabledSensors"] = disabled_sensors
+        result["platformDisabledSensors"] = platform_disabled_sensors
         # Suggested spot-multiplier defaults for the auto-detected provider —
         # already camelCase, attach after conversion to avoid double-conversion.
         result["pricingDefaults"] = _pricing_defaults_for_discovery(integrations)
@@ -3395,6 +3106,24 @@ async def setup_complete(payload: APISetupCompletePayload):
     from app import bess_controller
 
     try:
+        # A provider without its own required configuration can never fetch
+        # a price, so the whole optimizer aborts every cycle with "No price
+        # data available".  Reject it here rather than persisting a config
+        # that is guaranteed to fail (#549).  This runs before
+        # apply_discovered_config below, which persists on its own.
+        if payload.provider is not None:
+            required_field = _PROVIDER_REQUIRED_FIELD.get(payload.provider)
+            if required_field and not getattr(payload, required_field, None):
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"Energy provider '{payload.provider}' requires "
+                        f"'{required_field}', which is empty. Select the "
+                        f"provider you actually have configured in Home "
+                        f"Assistant, or install the integration first."
+                    ),
+                )
+
         sections: dict = {}
 
         # --- sensors & discovery ---
@@ -3432,7 +3161,6 @@ async def setup_complete(payload: APISetupCompletePayload):
             "minSoc": "min_soc",
             "maxSoc": "max_soc",
             "cycleCost": "cycle_cost_per_kwh",
-            "minActionProfitThreshold": "min_action_profit_threshold",
             "externalSolarMode": "external_solar_mode",
         }
         if any(getattr(payload, f) is not None for f in _BATTERY_MAP) or (
@@ -3457,12 +3185,20 @@ async def setup_complete(payload: APISetupCompletePayload):
             "safetyMarginFactor": "safety_margin",
             "phaseCount": "phase_count",
             "powerMonitoringEnabled": "power_monitoring_enabled",
+            "managedLoadSensors": "managed_load_sensors",
         }
         if any(getattr(payload, f) is not None for f in _HOME_MAP):
             home = bess_controller.settings_store.get_section("home")
             for field, key in _HOME_MAP.items():
                 if getattr(payload, field) is not None:
                     home[key] = getattr(payload, field)
+            effective_sensors = {
+                **bess_controller.settings_store.get_active_sensors(),
+                **flatten_sensors(sections.get("sensors") or {}),
+            }
+            _validate_power_monitoring_sensors(home, effective_sensors)
+            _validate_consumption_strategy(home, effective_sensors)
+            _validate_managed_load_sensors(home)
             sections["home"] = home
 
         # --- electricity price ---
@@ -3523,6 +3259,8 @@ async def setup_complete(payload: APISetupCompletePayload):
             inv_section["platform"] = _platform
             if payload.inverterControlMode is not None:
                 inv_section["control_mode"] = payload.inverterControlMode
+            if payload.inverterServiceDomain is not None:
+                inv_section["service_domain"] = payload.inverterServiceDomain
             if payload.huaweiDeviceId:
                 inv_section["device_id"] = payload.huaweiDeviceId
             sections["inverter"] = inv_section
@@ -3558,11 +3296,13 @@ async def setup_complete(payload: APISetupCompletePayload):
             ):
                 bess_controller.system.switch_control_mode(payload.inverterControlMode)
 
-        # Apply settings to live system so BESS starts immediately
-        # without requiring a restart. Unconditional, not gated on
-        # payload.sensors: an inverter platform switch above also changes
-        # which per-platform sensor sub-dict is active.
-        bess_controller.refresh_active_sensors()
+        # Apply settings to live system so BESS starts immediately without
+        # requiring a restart. Unconditional, not gated on payload.sensors:
+        # an inverter platform switch above also changes service_domain and
+        # the power polarities. ha_controller.sensors is a live settings_store
+        # view (#334) and needs no equivalent refresh.
+        bess_controller.refresh_service_domain()
+        bess_controller.refresh_power_polarities()
         if payload.growattDeviceId:
             bess_controller.ha_controller.growatt_device_id = payload.growattDeviceId
         if payload.huaweiDeviceId:
@@ -3584,7 +3324,6 @@ async def setup_complete(payload: APISetupCompletePayload):
                     "max_charge_power_kw": payload.maxChargeDischargePower,
                     "max_discharge_power_kw": payload.maxChargeDischargePower,
                     "cycle_cost_per_kwh": payload.cycleCost,
-                    "min_action_profit_threshold": payload.minActionProfitThreshold,
                     "external_solar_mode": payload.externalSolarMode,
                 }
             )
@@ -3601,6 +3340,7 @@ async def setup_complete(payload: APISetupCompletePayload):
                     "safety_margin": payload.safetyMarginFactor,
                     "phase_count": payload.phaseCount,
                     "power_monitoring_enabled": payload.powerMonitoringEnabled,
+                    "managed_load_sensors": payload.managedLoadSensors,
                 }
             )
         if "electricity_price" in sections:
@@ -3668,6 +3408,10 @@ async def setup_complete(payload: APISetupCompletePayload):
 
         logger.info(f"Setup complete: saved sections {list(sections.keys())}")
         return {"success": True, "saved_sections": list(sections.keys())}
+    except HTTPException:
+        # Preserve the original status code (e.g. 422 from sensor/platform
+        # validation) instead of masking it as a generic 500 below.
+        raise
     except Exception as e:
         logger.error(f"Error completing setup: {e}")
         raise HTTPException(status_code=500, detail=str(e)) from e

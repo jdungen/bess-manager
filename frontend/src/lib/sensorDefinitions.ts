@@ -66,7 +66,7 @@ export interface PerPlatformSensors {
 
 /** IDs of non-inverter (shared) integrations. */
 export const SHARED_INTEGRATION_IDS = new Set([
-  'nordpool', 'solar_forecast', 'consumption_forecast',
+  'nordpool', 'solar_forecast', 'consumption_forecast', 'consumption_overlay',
   'phase_current', 'discharge_inhibit', 'weather',
 ]);
 
@@ -117,7 +117,7 @@ const GROWATT_CLOUD_LIFETIME: SensorGroup = {
     { key: 'lifetime_solar_energy', label: 'Total Solar Energy', required: true },
     { key: 'lifetime_export_to_grid', label: 'Total Export to Grid', required: true },
     { key: 'lifetime_import_from_grid', label: 'Total Import from Grid', required: true },
-    { key: 'lifetime_load_consumption', label: 'Total Load Consumption', required: true },
+    { key: 'lifetime_load_consumption', label: 'Total Load Consumption', required: false },
   ],
 };
 
@@ -162,7 +162,7 @@ const GROWATT_CLOUD_SPH_LIFETIME: SensorGroup = {
     { key: 'lifetime_solar_energy', label: 'Total Solar Energy', required: true },
     { key: 'lifetime_export_to_grid', label: 'Total Export to Grid', required: true },
     { key: 'lifetime_import_from_grid', label: 'Total Import from Grid', required: true },
-    { key: 'lifetime_load_consumption', label: 'Total Load Consumption', required: true },
+    { key: 'lifetime_load_consumption', label: 'Total Load Consumption', required: false },
   ],
 };
 
@@ -204,8 +204,12 @@ export const INTEGRATIONS: IntegrationDef[] = [
         name: 'Battery Monitoring',
         sensors: [
           { key: 'battery_soc', label: 'Battery Capacity (SOC)', required: true },
-          { key: 'battery_charge_power', label: 'Battery Charge Power', required: true },
-          { key: 'battery_discharge_power', label: 'Battery Discharge Power', required: true },
+          // solax_modbus publishes one signed battery power entity
+          // (battery_power_charge, negative while discharging) and no
+          // discharge counterpart, so there is no second field to show —
+          // the backend derives discharge power from this one by sign
+          // (#542). Same shape as Solis grid power and Huawei battery power.
+          { key: 'battery_charge_power', label: 'Battery Power (net, signed)', required: true },
         ],
       },
       {
@@ -220,11 +224,11 @@ export const INTEGRATIONS: IntegrationDef[] = [
       {
         name: 'Lifetime Energy',
         sensors: [
-          { key: 'lifetime_battery_charged', label: 'Battery Input Energy Total', required: false },
-          { key: 'lifetime_battery_discharged', label: 'Battery Output Energy Total', required: false },
-          { key: 'lifetime_solar_energy', label: 'Total Solar Energy', required: false },
-          { key: 'lifetime_import_from_grid', label: 'Grid Import Total', required: false },
-          { key: 'lifetime_export_to_grid', label: 'Grid Export Total', required: false },
+          { key: 'lifetime_battery_charged', label: 'Battery Input Energy Total', required: true },
+          { key: 'lifetime_battery_discharged', label: 'Battery Output Energy Total', required: true },
+          { key: 'lifetime_solar_energy', label: 'Total Solar Energy', required: true },
+          { key: 'lifetime_import_from_grid', label: 'Grid Import Total', required: true },
+          { key: 'lifetime_export_to_grid', label: 'Grid Export Total', required: true },
         ],
       },
       {
@@ -276,11 +280,11 @@ export const INTEGRATIONS: IntegrationDef[] = [
       {
         name: 'Lifetime Energy',
         sensors: [
-          { key: 'lifetime_battery_charged', label: 'Battery Input Energy Total', required: false },
-          { key: 'lifetime_battery_discharged', label: 'Battery Output Energy Total', required: false },
-          { key: 'lifetime_solar_energy', label: 'Total Solar Energy', required: false },
-          { key: 'lifetime_import_from_grid', label: 'Grid Import Total', required: false },
-          { key: 'lifetime_export_to_grid', label: 'Grid Export Total', required: false },
+          { key: 'lifetime_battery_charged', label: 'Battery Input Energy Total', required: true },
+          { key: 'lifetime_battery_discharged', label: 'Battery Output Energy Total', required: true },
+          { key: 'lifetime_solar_energy', label: 'Total Solar Energy', required: true },
+          { key: 'lifetime_import_from_grid', label: 'Grid Import Total', required: true },
+          { key: 'lifetime_export_to_grid', label: 'Grid Export Total', required: true },
           { key: 'lifetime_load_consumption', label: 'Total Load Energy', required: false },
         ],
       },
@@ -302,6 +306,13 @@ export const INTEGRATIONS: IntegrationDef[] = [
           { key: 'growatt_vpp_allow_ac_charging', label: 'VPP Allow AC Charging', required: false },
           { key: 'growatt_vpp_time', label: 'VPP Time (Fallback Timer)', required: false },
           { key: 'growatt_vpp_power', label: 'VPP Power', required: false },
+        ],
+      },
+      {
+        name: 'Export Limit Curtailment (optional — requires a grid CT/smart meter)',
+        sensors: [
+          { key: 'growatt_export_limit_mode', label: 'Limit Grid Export', required: false },
+          { key: 'growatt_export_limit_value', label: 'Grid Export Limit', required: false },
         ],
       },
     ],
@@ -342,11 +353,11 @@ export const INTEGRATIONS: IntegrationDef[] = [
       {
         name: 'Lifetime Energy',
         sensors: [
-          { key: 'lifetime_battery_charged', label: 'Battery Input Energy Total', required: false },
-          { key: 'lifetime_battery_discharged', label: 'Battery Output Energy Total', required: false },
-          { key: 'lifetime_solar_energy', label: 'Total Solar Energy', required: false },
-          { key: 'lifetime_import_from_grid', label: 'Grid Import Total', required: false },
-          { key: 'lifetime_export_to_grid', label: 'Grid Export Total', required: false },
+          { key: 'lifetime_battery_charged', label: 'Battery Input Energy Total', required: true },
+          { key: 'lifetime_battery_discharged', label: 'Battery Output Energy Total', required: true },
+          { key: 'lifetime_solar_energy', label: 'Total Solar Energy', required: true },
+          { key: 'lifetime_import_from_grid', label: 'Grid Import Total', required: true },
+          { key: 'lifetime_export_to_grid', label: 'Grid Export Total', required: true },
           { key: 'lifetime_load_consumption', label: 'Total Load', required: false },
         ],
       },
@@ -360,13 +371,20 @@ export const INTEGRATIONS: IntegrationDef[] = [
           { key: 'growatt_vpp_power', label: 'VPP Power', required: true },
         ],
       },
+      {
+        name: 'Export Limit Curtailment (optional — requires a grid CT/smart meter)',
+        sensors: [
+          { key: 'growatt_export_limit_mode', label: 'Limit Grid Export', required: false },
+          { key: 'growatt_export_limit_value', label: 'Grid Export Limit', required: false },
+        ],
+      },
     ],
   },
   {
     id: 'solis_modbus',
     name: 'Solis Modbus',
     required: true,
-    description: 'Solis hybrid inverter controlled via the Pho3niX90/solis_modbus integration (local Modbus, Grid Time of Use v2 schedule — 6 charge + 6 discharge periods). Experimental — not yet validated against a real Solis installation.',
+    description: 'Solis hybrid inverter controlled via the Pho3niX90/solis_modbus integration (local Modbus, Grid Time of Use v2 schedule — 6 charge + 6 discharge periods).',
     sensorGroups: [
       {
         name: 'Battery Monitoring',
@@ -387,11 +405,12 @@ export const INTEGRATIONS: IntegrationDef[] = [
       {
         name: 'Lifetime Energy',
         sensors: [
-          { key: 'lifetime_battery_charged', label: 'Total Battery Charge Energy', required: false },
-          { key: 'lifetime_battery_discharged', label: 'Total Battery Discharge Energy', required: false },
-          { key: 'lifetime_solar_energy', label: 'PV Total Energy Generation', required: false },
-          { key: 'lifetime_import_from_grid', label: 'Total Energy Imported From Grid', required: false },
-          { key: 'lifetime_export_to_grid', label: 'Total Energy Fed Into Grid', required: false },
+          { key: 'lifetime_battery_charged', label: 'Total Battery Charge Energy', required: true },
+          { key: 'lifetime_battery_discharged', label: 'Total Battery Discharge Energy', required: true },
+          { key: 'lifetime_solar_energy', label: 'PV Total Energy Generation', required: true },
+          { key: 'lifetime_import_from_grid', label: 'Total Energy Imported From Grid', required: true },
+          { key: 'lifetime_export_to_grid', label: 'Total Energy Fed Into Grid', required: true },
+          { key: 'lifetime_load_consumption', label: 'Total Energy Consumption', required: false },
         ],
       },
       {
@@ -458,11 +477,15 @@ export const INTEGRATIONS: IntegrationDef[] = [
       {
         name: 'Battery Control',
         sensors: [
-          { key: 'huawei_working_mode', label: 'Working Mode (select)', required: true },
+          // EMMA-fronted SUN2000 installs expose no LUNA2000 working-mode
+          // select (the energy manager owns the mode), so requiring it would
+          // block wizard completion for exactly the installs this serves.
+          { key: 'huawei_working_mode', label: 'Working Mode (select)', required: false },
+          { key: 'huawei_tou_periods', label: 'TOU Charging/Discharging Periods (readback)', required: false },
           { key: 'battery_charging_power_rate', label: 'Maximum Charging Power', required: false },
           { key: 'battery_discharging_power_rate', label: 'Maximum Discharging Power', required: false },
           { key: 'battery_charge_stop_soc', label: 'Charging Cutoff Capacity', required: true },
-          { key: 'battery_discharge_stop_soc', label: 'Grid-Charge Cutoff SOC', required: true },
+          { key: 'battery_discharge_stop_soc', label: 'Discharging Cutoff Capacity', required: true },
           { key: 'grid_charge', label: 'Charge From Grid Function', required: false },
         ],
       },
@@ -470,6 +493,21 @@ export const INTEGRATIONS: IntegrationDef[] = [
         name: 'Power Monitoring',
         sensors: [
           { key: 'local_load_power', label: 'Inverter Active Power', required: false },
+          { key: 'pv_power', label: 'Solar PV Power (Input Power)', required: false },
+          { key: 'import_power', label: 'Grid Power (power meter, net signed)', required: false },
+        ],
+      },
+      {
+        name: 'Lifetime Energy',
+        sensors: [
+          { key: 'lifetime_solar_energy', label: 'Accumulated Yield Energy', required: true },
+          { key: 'lifetime_battery_charged', label: 'Battery Total Charge', required: true },
+          { key: 'lifetime_battery_discharged', label: 'Battery Total Discharge', required: true },
+          { key: 'lifetime_export_to_grid', label: 'Grid Exported Energy (power meter)', required: true },
+          { key: 'lifetime_import_from_grid', label: 'Grid Accumulated Energy (power meter)', required: true },
+          // EMMA-only, disabled by default in HA — enable "Total Energy
+          // Consumption" on the EMMA device, then re-run discovery (#730).
+          { key: 'lifetime_load_consumption', label: 'Total Energy Consumption (EMMA)', required: false },
         ],
       },
     ],
@@ -506,6 +544,21 @@ export const INTEGRATIONS: IntegrationDef[] = [
         name: 'Consumption',
         sensors: [
           { key: '48h_avg_grid_import', label: '48h Avg Grid Import', required: false },
+        ],
+      },
+    ],
+  },
+  {
+    id: 'consumption_overlay',
+    name: 'Planned Consumption Changes',
+    required: false,
+    description:
+      'Optional. A template sensor whose "blocks" attribute declares consumption you know is coming — an EV session tonight, a pool pump you are skipping. Applies on top of whichever consumption forecast you use.',
+    sensorGroups: [
+      {
+        name: 'Planned Changes',
+        sensors: [
+          { key: 'consumption_overlay', label: 'Planned Consumption Changes', required: false },
         ],
       },
     ],

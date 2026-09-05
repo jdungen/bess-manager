@@ -43,6 +43,9 @@ Issue opened/edited  → issue-triage.yml      [auto, ~$0.05]
                        → delegates to `bess-analyst` sub-agent
                        → posts Root cause / Evidence / Proposed fix
                        → label `analyzed` (or `needs-human-review`)
+                       → job FAILS if it posted no comment or applied
+                         neither label — a run that analysed nothing
+                         must not report success (#646)
 
 @claude-bot fix      → issue-fix.yml        [manual, ~$1–4]
                        → reads Stage 2 diagnosis comment
@@ -50,15 +53,20 @@ Issue opened/edited  → issue-triage.yml      [auto, ~$0.05]
                        → opens DRAFT PR (never auto-merged)
                        → label `has-fix-pr`
 
-@claude-bot review   → pr-review.yml        [manual, ~$0.50–2]
+@claude-bot review   → pr-review.yml        [manual or implement-issue, ~$0.50–2]
+                       → owner, or `bess-agent` (implement-issue Step 11 loop)
                        → reviews diff against rules.md + claude-bot.md
                        → posts inline comments + summary verdict
+                       → loop repeats until APPROVED, max 3 rounds
 
 YOU approve + merge  → human decision, always
 ```
 
-**Gates:** Stages 2, 3, and 4 are manually triggered — the bot never
-spends money on its own. Stage 1 is auto but cheap.
+**Gates:** Stages 2 and 3 are manually triggered — the bot never spends money
+on its own. Stage 1 is auto but cheap. Stage 4 is manual too, except when
+`implement-issue`'s Step 11 loop requests it as `bess-agent` on a PR that
+session just opened; that loop is capped at 3 rounds, so the spend is bounded
+and it only ever reviews the session's own diff.
 
 ## PR Merge Workflow
 
@@ -119,10 +127,22 @@ build checklist.
 
 ### Fixed
 
-- Short description.
+- Short description. ([#123](https://github.com/johanzander/bess-manager/issues/123))
 ```
 
-One line per change. No implementation details. Match existing style.
+**One line per change, hard limit ~25 words after the bold lead-in. No root
+cause, no file/function names, no "confirmed via debug bundle" narrative —
+that belongs in the PR description, not the changelog.** Bad (an actual past
+entry, do not reproduce this): *"Terminal-value arbitrage cap used an
+already-committed near-term sell price, causing large spurious swings...
+`_calculate_terminal_value`'s arbitrage-consistency cap (`sell_cap =
+max(sell_prices) * efficiency_discharge - cycle_cost`) used `max()` over the
+*entire* remaining horizon..."* (150+ words). Good: *"Fixed a terminal-value
+bug that caused spurious swings in tomorrow's export plan."*
+
+Match existing entries' **format** (bold lead, trailing issue/PR link) —
+never their **length**. Many existing entries are far too long; that history
+is not the style to match.
 
 ## Labels
 

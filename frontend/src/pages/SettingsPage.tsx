@@ -39,14 +39,16 @@ const EMPTY_BATTERY: BatteryForm = {
   maxChargeDischargePowerKw: 0,
   cycleCostPerKwh: 0,
   efficiencyCharge: 97, efficiencyDischarge: 97,
-  temperatureDeratingEnabled: false, minActionProfit: 0,
+  temperatureDeratingEnabled: false,
   inverterMaxAcPowerKw: 0, inverterAcPowerMargin: 0.05,
+  exportCurtailmentEnabled: false, exportCurtailmentPriceFloor: 0,
   externalSolarMode: false,
 };
 const EMPTY_HOME: HomeForm = {
-  consumption: 3.5, consumptionStrategy: 'sensor',
+  consumption: 3.5, consumptionStrategy: 'fixed',
   maxFuseCurrent: 25, voltage: 230, safetyMarginFactor: 1.0,
   phaseCount: 3, powerMonitoringEnabled: true,
+  managedLoadSensors: [],
 };
 const EMPTY_PRICING: PricingForm = {
   currency: 'SEK',
@@ -172,9 +174,10 @@ const SettingsPage: React.FC = () => {
         efficiencyCharge: bat_s.efficiencyCharge ?? 0.97,
         efficiencyDischarge: bat_s.efficiencyDischarge ?? 0.95,
         temperatureDeratingEnabled: bat_s.temperatureDerating?.enabled ?? false,
-        minActionProfit: bat_s.minActionProfitThreshold ?? 0,
         inverterMaxAcPowerKw: bat_s.inverterMaxAcPowerKw ?? 0,
         inverterAcPowerMargin: bat_s.inverterAcPowerMargin ?? 0.05,
+        exportCurtailmentEnabled: bat_s.exportCurtailmentEnabled ?? false,
+        exportCurtailmentPriceFloor: bat_s.exportCurtailmentPriceFloor ?? 0,
         externalSolarMode: bat_s.externalSolarMode ?? false,
       };
       setBatteryForm(bat);
@@ -182,12 +185,13 @@ const SettingsPage: React.FC = () => {
 
       const h: HomeForm = {
         consumption: home_s.defaultHourly ?? 3.5,
-        consumptionStrategy: home_s.consumptionStrategy ?? 'sensor',
+        consumptionStrategy: home_s.consumptionStrategy ?? 'fixed',
         maxFuseCurrent: home_s.maxFuseCurrent ?? 25,
         voltage: home_s.voltage ?? 230,
         safetyMarginFactor: home_s.safetyMargin ?? 1.0,
         phaseCount: home_s.phaseCount ?? 3,
         powerMonitoringEnabled: home_s.powerMonitoringEnabled ?? true,
+        managedLoadSensors: home_s.managedLoadSensors ?? [],
       };
       setHomeForm(h);
       savedHome.current = JSON.stringify(h);
@@ -216,10 +220,17 @@ const SettingsPage: React.FC = () => {
 
       const invNew = s.inverter ?? {};
       const uiType = invNew.platform ?? 'growatt_server_min';
+      // The Huawei battery device_id lives on the inverter section; every
+      // other platform's device_id is the Growatt cloud one. Loading the
+      // wrong one leaves the field blank on a Huawei install and a save
+      // then cross-writes it into the other platform's section.
+      const isHuawei = uiType === 'huawei_solar_luna2000';
       const inv: InverterForm = {
         inverterPlatform: uiType,
-        deviceId: growatt_s.deviceId ?? '',
+        deviceId: (isHuawei ? invNew.deviceId : growatt_s.deviceId) ?? '',
         controlMode: (invNew.controlMode as 'tou' | 'vpp' | undefined) ?? 'tou',
+        serviceDomain: (invNew.serviceDomain as string | undefined) ?? '',
+        resolvedServiceDomain: (invNew.resolvedServiceDomain as string | undefined) ?? '',
       };
       setInverterForm(inv);
       savedInverter.current = JSON.stringify(inv);
@@ -391,6 +402,9 @@ const SettingsPage: React.FC = () => {
           safetyMargin: homeForm.safetyMarginFactor,
           phaseCount: homeForm.phaseCount,
           powerMonitoringEnabled: homeForm.powerMonitoringEnabled,
+          // Drop blank rows left by "+ Add managed load sensor" — the API
+          // rejects an empty string as an invalid entity ID.
+          managedLoadSensors: homeForm.managedLoadSensors.filter(Boolean),
           currency: pricingForm.currency,
         },
       });
@@ -445,7 +459,7 @@ const SettingsPage: React.FC = () => {
   const saveBattery = async () => {
     setSaving(true);
     try {
-      await api.patch('/api/settings', {
+      const saved = await api.patch('/api/settings', {
         battery: {
           totalCapacity: batteryForm.totalCapacity,
           minSoc: batteryForm.minSoc,
@@ -453,27 +467,41 @@ const SettingsPage: React.FC = () => {
           maxChargePowerKw: batteryForm.maxChargeDischargePowerKw,
           maxDischargePowerKw: batteryForm.maxChargeDischargePowerKw,
           cycleCostPerKwh: batteryForm.cycleCostPerKwh,
-          minActionProfitThreshold: batteryForm.minActionProfit,
           efficiencyCharge: batteryForm.efficiencyCharge,
           efficiencyDischarge: batteryForm.efficiencyDischarge,
           inverterMaxAcPowerKw: batteryForm.inverterMaxAcPowerKw,
           inverterAcPowerMargin: batteryForm.inverterAcPowerMargin,
+          exportCurtailmentEnabled: batteryForm.exportCurtailmentEnabled,
+          exportCurtailmentPriceFloor: batteryForm.exportCurtailmentPriceFloor,
           temperatureDerating: {
             enabled: batteryForm.temperatureDeratingEnabled,
             weatherEntity: sensors.shared?.['weather_entity'] ?? '',
           },
           externalSolarMode: batteryForm.externalSolarMode,
         },
-        growatt: {
-          deviceId: inverterForm.deviceId,
-        },
+        ...(inverterForm.inverterPlatform === 'huawei_solar_luna2000'
+          ? {}
+          : { growatt: { deviceId: inverterForm.deviceId } }),
         inverter: {
           platform: inverterForm.inverterPlatform,
           controlMode: inverterForm.controlMode ?? 'tou',
+          serviceDomain: inverterForm.serviceDomain ?? '',
+          ...(inverterForm.inverterPlatform === 'huawei_solar_luna2000'
+            ? { deviceId: inverterForm.deviceId }
+            : {}),
         },
       });
       savedBattery.current = JSON.stringify(batteryForm);
-      savedInverter.current = JSON.stringify(inverterForm);
+      // The effective domain is computed server-side and changes when the
+      // platform or override does — take it from the save response rather
+      // than leaving the placeholder showing the value fetched at page load.
+      const resolved = (saved as { inverter?: { resolvedServiceDomain?: string } })
+        ?.inverter?.resolvedServiceDomain;
+      const updatedInverter = resolved === undefined
+        ? inverterForm
+        : { ...inverterForm, resolvedServiceDomain: resolved };
+      setInverterForm(updatedInverter);
+      savedInverter.current = JSON.stringify(updatedInverter);
       setToast({ type: 'success', message: 'Battery settings saved.' });
     } catch (err) {
       setToast({ type: 'error', message: err instanceof Error ? err.message : 'Save failed.' });

@@ -97,11 +97,11 @@
   },
   "expected_results": {
     "base_cost": 50.31,
-    "battery_solar_cost": -31.03,
-    "base_to_battery_solar_savings": 81.34,
-    "base_to_battery_solar_savings_pct": 161.6776,
-    "total_charged": 48.3657,
-    "total_discharged": 43.6
+    "battery_solar_cost": -31.09,
+    "base_to_battery_solar_savings": 81.4,
+    "base_to_battery_solar_savings_pct": 161.79686,
+    "total_charged": 48.0,
+    "total_discharged": 43.32
   },
   "expected_behavior": {
     "description": "Negative prices: should aggressively grid-charge during negative-price hours and export during positive peaks",
@@ -114,5 +114,9 @@
       "soe_within_bounds": true,
       "power_within_limits": true
     }
-  }
+  },
+  "_zero_spread_reason": "Zero-spread (buy==sell) price_data is intentional, not an oversight: this fixture's purpose is testing negative BUY-price behavior (base_prices go as low as -0.30 SEK), and the app's realistic additional_costs (a large fixed grid+tax fee) would push the buy price positive even in those hours, defeating the scenario -- see docs/superpowers/specs/2026-08-03-milp-optimizer-pivot-450.md follow-up.",
+  "terminal_value_per_kwh": 0.3325,
+  "terminal_knee_kwh": 20.421052632,
+  "terminal_tail_rate": -0.285
 }

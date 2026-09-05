@@ -44,6 +44,11 @@ def controller(battery_settings: BatterySettings) -> SolaxController:
     return SolaxController(battery_settings=battery_settings)
 
 
+@pytest.fixture
+def solax_controller(battery_settings: BatterySettings) -> SolaxController:
+    return SolaxController(battery_settings=battery_settings)
+
+
 # ── Active TOU intervals ──────────────────────────────────────────────────────
 
 
@@ -83,7 +88,7 @@ class TestApplyIntents:
         assert controller.current_schedule is schedule
 
 
-# ── write_to_hardware ────────────────────────────────────────────────
+# ── sync_to_hardware ────────────────────────────────────────────────
 
 
 class TestWriteScheduleToHardware:
@@ -91,7 +96,7 @@ class TestWriteScheduleToHardware:
         self, controller: SolaxController
     ) -> None:
         mock_hw = MagicMock()
-        writes, disables = controller.write_to_hardware(mock_hw, 0, [])
+        writes, disables = controller.sync_to_hardware(mock_hw, 0)
 
         assert writes == 0
         assert disables == 0
@@ -100,7 +105,7 @@ class TestWriteScheduleToHardware:
         self, controller: SolaxController
     ) -> None:
         mock_hw = MagicMock()
-        controller.write_to_hardware(mock_hw, 0, [])
+        controller.sync_to_hardware(mock_hw, 0)
 
         mock_hw.assert_not_called()
 
@@ -398,9 +403,55 @@ class TestGetAllTouSegments:
             "segment_id",
             "start_time",
             "end_time",
-            "batt_mode",
+            "vpp_power_pct",
+            "vpp_remote_control",
             "enabled",
         }
 
         for segment in segments:
             assert required_fields.issubset(segment.keys())
+
+    def test_get_all_tou_segments_solar_export_reflects_self_use_not_a_hold(
+        self, solax_controller
+    ) -> None:
+        solax_controller.strategic_intents = ["SOLAR_EXPORT"] * 4
+        solax_controller.current_schedule = None
+        segments = solax_controller.get_all_tou_segments()
+        assert len(segments) == 1
+        segment = segments[0]
+        assert "batt_mode" not in segment
+        assert segment["vpp_power_pct"] == 0
+        assert segment["vpp_remote_control"] is False  # SolaX's real (unfixed) behavior
+
+
+# ── _vpp_display_state ────────────────────────────────────────────────────────
+
+
+class TestVppDisplayState:
+    """_vpp_display_state must mirror _write_period_to_hardware exactly —
+    same three branches, same sign convention (power_pct as percent of
+    max, matching the discharge_rate parameter it's built from)."""
+
+    def test_grid_charge_shows_full_positive_power_remote_enabled(
+        self, solax_controller
+    ):
+        power_pct, remote_control = solax_controller._vpp_display_state(
+            grid_charge=True, discharge_rate=0
+        )
+        assert (power_pct, remote_control) == (100, True)
+
+    def test_discharge_shows_negative_power_remote_enabled(self, solax_controller):
+        power_pct, remote_control = solax_controller._vpp_display_state(
+            grid_charge=False, discharge_rate=60
+        )
+        assert (power_pct, remote_control) == (-60, True)
+
+    def test_idle_shows_zero_power_remote_disabled(self, solax_controller):
+        """Matches _write_period_to_hardware's `set_solax_vpp_disabled()`
+        branch (grid_charge=False, discharge_rate=0) -- self-use passthrough,
+        NOT a grid-first hold. SolaX has no block_passive_charging
+        equivalent (see TODO.md gap note)."""
+        power_pct, remote_control = solax_controller._vpp_display_state(
+            grid_charge=False, discharge_rate=0
+        )
+        assert (power_pct, remote_control) == (0, False)

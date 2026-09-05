@@ -40,7 +40,26 @@ const PROVIDER_LABEL: Record<string, string> = {
 // Tests
 // ---------------------------------------------------------------------------
 
+/**
+ * Some scenarios exist to prove a wizard gate holds (#549), so the step
+ * they block is unreachable by design. Call these as the first line of any
+ * test that navigates past that step.
+ */
+function skipIfSensorStepBlocked() {
+  test.skip(
+    !!expected.sensorStepBlocked,
+    'scenario deliberately blocks the sensor step (disabled entities)',
+  );
+}
+function skipIfPricingStepBlocked() {
+  test.skip(
+    !!expected.sensorStepBlocked || !!expected.pricingBlocked,
+    'scenario deliberately blocks the sensor or pricing step',
+  );
+}
+
 test.describe('Setup Wizard', () => {
+
   test('redirects to /setup when no sensors are configured', async ({ page }) => {
     await page.goto('/');
     await expect(page).toHaveURL('/setup', { timeout: 15_000 });
@@ -59,6 +78,7 @@ test.describe('Setup Wizard', () => {
   });
 
   test('auto-selects correct pricing provider', async ({ page }) => {
+    skipIfSensorStepBlocked()
     await page.goto('/setup');
     await expectActiveStep(page, 1);
 
@@ -113,6 +133,7 @@ test.describe('Setup Wizard', () => {
   });
 
   test('provider-specific fields shown correctly', async ({ page }) => {
+    skipIfSensorStepBlocked()
     await page.goto('/setup');
     await expectActiveStep(page, 1);
 
@@ -147,6 +168,7 @@ test.describe('Setup Wizard', () => {
   });
 
   test('can switch provider when both are available', async ({ page }) => {
+    skipIfSensorStepBlocked()
     // Only meaningful when both providers are detected
     test.skip(!expected.nordpoolFound || !expected.octopusFound,
       'Scenario has only one provider');
@@ -176,6 +198,7 @@ test.describe('Setup Wizard', () => {
   });
 
   test('completes full wizard flow end-to-end', async ({ page }) => {
+    skipIfPricingStepBlocked()
     await page.goto('/setup');
 
     // Step 0 → 1: Scan
@@ -213,6 +236,7 @@ test.describe('Setup Wizard', () => {
   });
 
   test('can navigate back and forth without losing state', async ({ page }) => {
+    skipIfSensorStepBlocked()
     await page.goto('/setup');
     await expectActiveStep(page, 1);
 
@@ -233,6 +257,7 @@ test.describe('Setup Wizard', () => {
   });
 
   test('edited battery values appear in summary', async ({ page }) => {
+    skipIfPricingStepBlocked()
     await page.goto('/setup');
     await expectActiveStep(page, 1);
 
@@ -264,11 +289,18 @@ test.describe('Setup Wizard', () => {
   });
 
   test('home step gates features by platform capabilities', async ({ page }) => {
+    skipIfPricingStepBlocked()
     // SPH lacks local_load_power; SolaX native has it (as house_load)
     const platformsWithoutLocalLoad = ['growatt_server_sph'];
     const platformsWithoutChargeRate = ['growatt_server_sph', 'solax_modbus_native', 'solis_modbus'];
-    const expectInfluxDisabled = platformsWithoutLocalLoad.includes(expected.inverterPlatform);
-    const expectFuseDisabled = platformsWithoutChargeRate.includes(expected.inverterPlatform);
+    const expectLoadPowerAvgDisabled = platformsWithoutLocalLoad.includes(expected.inverterPlatform);
+    // Fuse protection also needs phase-current sensors (current_l1/l2/l3) discovered,
+    // independent of the platform's charge-rate-control capability — a platform that
+    // supports charge rate control can still lack phase sensors on an install with no
+    // CT clamps configured. Most fixtures provide both; noPhaseSensors opts a scenario
+    // out explicitly instead of overloading the (separately-purposed) phaseCount field.
+    const expectFuseDisabled =
+      platformsWithoutChargeRate.includes(expected.inverterPlatform) || expected.noPhaseSensors === true;
 
     await page.goto('/setup');
     await expectActiveStep(page, 1);
@@ -281,12 +313,12 @@ test.describe('Setup Wizard', () => {
     await page.getByRole('button', { name: /Next: Home/i }).click();
     await expectActiveStep(page, 4);
 
-    // InfluxDB radio should be disabled on platforms without local_load_power
-    const influxRadio = radioByLabel(page, 'InfluxDB (requires InfluxDB integration)');
-    if (expectInfluxDisabled) {
-      await expect(influxRadio).toBeDisabled();
+    // Load Power 7-day Avg radio should be disabled on platforms without local_load_power
+    const loadPowerAvgRadio = radioByLabel(page, 'Load Power 7-day Avg');
+    if (expectLoadPowerAvgDisabled) {
+      await expect(loadPowerAvgRadio).toBeDisabled();
     } else {
-      await expect(influxRadio).toBeEnabled();
+      await expect(loadPowerAvgRadio).toBeEnabled();
     }
 
     // Fuse protection toggle should be disabled on platforms without charge rate control
@@ -296,5 +328,297 @@ test.describe('Setup Wizard', () => {
     } else {
       await expect(fuseToggle).toBeEnabled();
     }
+  });
+
+  test('partial phase-current discovery does not auto-enable fuse protection or seed an invalid phase count', async ({ page }) => {
+    skipIfPricingStepBlocked()
+    // Regression test: discovery finding only 2 of the 3 current_l1/l2/l3
+    // sensors (detectedPhaseCount === 2) must not auto-enable fuse
+    // protection (current_l3 is missing, so real-time monitoring would
+    // crash on a None read) and must not seed HomeSettings.phase_count with
+    // the raw count 2, which core/bess/settings.py rejects (only 1 or 3 are
+    // valid). Stubs POST /api/setup/discover directly, following the
+    // page.route() mocking pattern used in inverter-schedule-control-model.spec.ts,
+    // since no mock-HA fixture scenario currently reproduces a partial
+    // phase-sensor discovery.
+    //
+    // Also stubs GET /api/settings to a clean baseline: this test runs after
+    // other tests in this file that complete the wizard for real against the
+    // shared backend, which can leave power_monitoring_enabled=true (and
+    // current_l1/2/3 sensors) already persisted. Without this stub, the
+    // wizard's "load existing settings" step (SetupWizardPage.tsx) would
+    // pick up that leftover state and mask the very regression this test
+    // exists to catch.
+    await page.route('**/api/settings', async (route) => {
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({
+          battery: {},
+          home: {},
+          electricityPrice: {},
+          energyProvider: {},
+          growatt: {},
+          sensors: {},
+        }),
+      });
+    });
+
+    const growattRequiredSensors = {
+      battery_soc: 'sensor.battery_soc',
+      battery_charge_power: 'sensor.battery_charge_power',
+      battery_discharge_power: 'sensor.battery_discharge_power',
+      battery_charge_stop_soc: 'number.battery_charge_stop_soc',
+      battery_discharge_stop_soc: 'number.battery_discharge_stop_soc',
+      battery_charging_power_rate: 'number.battery_charging_power_rate',
+      battery_discharging_power_rate: 'number.battery_discharging_power_rate',
+      grid_charge: 'switch.grid_charge',
+      lifetime_battery_charged: 'sensor.lifetime_battery_charged',
+      lifetime_battery_discharged: 'sensor.lifetime_battery_discharged',
+      lifetime_solar_energy: 'sensor.lifetime_solar_energy',
+      lifetime_export_to_grid: 'sensor.lifetime_export_to_grid',
+      lifetime_import_from_grid: 'sensor.lifetime_import_from_grid',
+      lifetime_load_consumption: 'sensor.lifetime_load_consumption',
+    };
+
+    await page.route('**/api/setup/discover', async (route) => {
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({
+          growattFound: true,
+          growattDeviceId: 'device1',
+          solaxFound: false,
+          solaxHasGrowattTou: false,
+          solaxHasGrowattGen3: false,
+          solisFound: false,
+          huaweiFound: false,
+          huaweiDeviceId: null,
+          nordpoolFound: true,
+          nordpoolArea: 'SE3',
+          nordpoolCustomArea: null,
+          nordpoolCustomEntity: null,
+          nordpoolConfigEntryId: 'entry1',
+          octopusFound: false,
+          entsoeFound: false,
+          entsoeEntity: null,
+          // Only current_l1 and current_l2 discovered -- current_l3 is
+          // missing, so this is a partial (2-of-3) phase discovery.
+          sensors: { current_l1: 'sensor.current_l1', current_l2: 'sensor.current_l2' },
+          platformSensors: { growatt_server_min: growattRequiredSensors },
+          missingSensors: [],
+          detectedInverterPlatforms: ['growatt_server_min'],
+          detectedPhaseCount: 2,
+          currency: 'SEK',
+          vatMultiplier: 1.25,
+        }),
+      });
+    });
+
+    await page.goto('/setup');
+    await expectActiveStep(page, 1);
+
+    // Navigate to the Home step (step 4)
+    await page.getByRole('button', { name: /Next: Electricity Pricing/i }).click();
+    await expectActiveStep(page, 2);
+    await page.getByRole('button', { name: /Next: Battery/i }).click();
+    await expectActiveStep(page, 3);
+    await page.getByRole('button', { name: /Next: Home/i }).click();
+    await expectActiveStep(page, 4);
+
+    // Must NOT have been auto-enabled -- current_l3 is missing, so the
+    // required-sensor set for the default (3-phase) HomeSettings config
+    // isn't fully mapped.
+    const fuseToggle = page.getByRole('switch', { name: /Enable fuse protection/i });
+    await expect(fuseToggle).not.toBeChecked();
+    await expect(fuseToggle).toBeDisabled();
+
+    // The Phase Count radio group is always rendered (it's used by the
+    // day-ahead scheduler regardless of fuse protection), so confirm the
+    // real invariant directly: phaseCount was never seeded with the invalid
+    // raw discovery count of 2 -- it stayed at the default of 3-phase, and
+    // the 1-phase option was not selected either.
+    await expect(page.getByRole('radio', { name: '3-phase' })).toBeChecked();
+    await expect(page.getByRole('radio', { name: '1-phase' })).not.toBeChecked();
+  });
+
+  // -------------------------------------------------------------------------
+  // Issue #549: the wizard must refuse configuration it cannot make work
+  // -------------------------------------------------------------------------
+
+  test('blocks the sensor step when a required entity is disabled in HA', async ({ page }) => {
+    test.skip(!expected.disabledEntities, 'scenario has no disabled entities');
+
+    await page.goto('/setup');
+    await expectActiveStep(page, 1);
+
+    // The user is told which entities to switch on — not that they are
+    // "missing", which is what the old runtime 404 claimed.
+    const warning = page.getByTestId('disabled-entities-warning');
+    await expect(warning).toBeVisible();
+    for (const entityId of expected.disabledEntities!) {
+      await expect(warning).toContainText(entityId);
+    }
+
+    // And setup cannot proceed with a mapping that would 404 at runtime.
+    await expect(
+      page.getByRole('button', { name: /Next: Electricity Pricing/i }),
+    ).toBeDisabled();
+  });
+
+  test('blocks the pricing step when the selected provider is unconfigured', async ({ page }) => {
+    test.skip(!expected.pricingBlocked, 'scenario has a usable price provider');
+
+    await page.goto('/setup');
+    await expectActiveStep(page, 1);
+    await page.getByRole('button', { name: /Next: Electricity Pricing/i }).click();
+    await expectActiveStep(page, 2);
+
+    // No Nord Pool integration exists, so the defaulted provider has an
+    // empty config entry — completing here would persist a config that can
+    // never fetch a price and abort every optimizer cycle.
+    await expect(page.getByTestId('pricing-incomplete-warning')).toBeVisible();
+    await expect(page.getByRole('button', { name: /Next: Battery/i })).toBeDisabled();
+
+    // Supplying the missing field releases the gate.
+    await fieldByLabel(page, /Config Entry ID/).fill('entry-nordpool-manual');
+    await expect(page.getByTestId('pricing-incomplete-warning')).toBeHidden();
+    await expect(page.getByRole('button', { name: /Next: Battery/i })).toBeEnabled();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Undetected inverter platform (#621)
+// ---------------------------------------------------------------------------
+
+/**
+ * A user whose inverter integration is not one BESS recognises — the
+ * reporter runs Huawei LUNA2000/EMMA through `huawei_emma_management`, so
+ * `_INVERTER_PLATFORMS` (which matches only `huawei_solar`) detects nothing.
+ *
+ * Discovery failing must narrow the wizard's *defaults*, not its *choices*:
+ * a user who knows their platform has to be able to pick it and configure
+ * the sensors by hand. These tests stub a discovery in which nothing at all
+ * was recognised, which is exactly that user's state.
+ */
+test.describe('Setup Wizard — undetected inverter platform', () => {
+  const NOTHING_DETECTED = {
+    growattFound: false,
+    growattDeviceId: null,
+    huaweiFound: false,
+    huaweiDeviceId: null,
+    solaxFound: false,
+    solaxHasGrowattTou: false,
+    solaxHasGrowattGen3: false,
+    solisFound: false,
+    nordpoolFound: true,
+    nordpoolArea: 'SE3',
+    nordpoolCustomArea: null,
+    nordpoolCustomEntity: null,
+    nordpoolConfigEntryId: 'entry1',
+    octopusFound: false,
+    entsoeFound: false,
+    entsoeEntity: null,
+    sensors: {},
+    platformSensors: {},
+    missingSensors: [],
+    detectedInverterPlatforms: [],
+    detectedPhaseCount: null,
+    currency: 'SEK',
+    vatMultiplier: 1.25,
+  };
+
+  test.beforeEach(async ({ page }) => {
+    await page.route('**/api/setup/discover', async (route) => {
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify(NOTHING_DETECTED),
+      });
+    });
+  });
+
+  /** Fill every sensor input the wizard reports as undetected. */
+  async function fillAllUndetectedSensors(page: Page) {
+    const missing = page.locator('input[placeholder="Not detected — enter entity ID"]');
+    // The placeholder clears as each field is filled, so the set shrinks and
+    // the loop terminates. The cap only guards against a non-shrinking set.
+    for (let i = 0; i < 200 && (await missing.count()) > 0; i++) {
+      await missing.first().fill(`sensor.manual_entity_${i}`);
+    }
+    await expect(missing).toHaveCount(0);
+  }
+
+  test('every platform tab stays selectable when nothing is detected', async ({ page }) => {
+    await page.goto('/setup');
+    await expectActiveStep(page, 1);
+
+    // Detection failed for all four, so under the old gate every tab was
+    // disabled and the wizard had no reachable platform at all.
+    for (const name of [/Growatt Cloud/i, /SolaX Modbus/i, /Solis Modbus/i, /Huawei/i]) {
+      await expect(page.getByRole('tab', { name })).toBeEnabled();
+    }
+
+    // And the choice actually takes: selecting Huawei reveals its panel.
+    await page.getByRole('tab', { name: /Huawei/i }).click();
+    await expect(page.getByText('LUNA2000')).toBeVisible();
+    await expect(page.getByPlaceholder('Huawei battery device ID')).toBeVisible();
+  });
+
+  test('a manually selected platform survives a re-scan', async ({ page }) => {
+    await page.goto('/setup');
+    await expectActiveStep(page, 1);
+
+    await page.getByRole('tab', { name: /Huawei/i }).click();
+    await expect(page.getByPlaceholder('Huawei battery device ID')).toBeVisible();
+
+    // Re-scan is the button this user reaches for after a failed detection.
+    // It must not silently revert the platform they just chose: the required
+    // -sensor list follows the selected tab while the filled-in check reads
+    // the sensor dict named by `sensors.platform`, so if those two diverge
+    // the step can never be completed no matter what is typed.
+    await page.getByRole('button', { name: /Re-scan/i }).click();
+    await expect(page.getByPlaceholder('Huawei battery device ID')).toBeVisible();
+
+    await fillAllUndetectedSensors(page);
+
+    // Huawei LUNA2000 gates step completion on a battery Device ID — it
+    // targets huawei_solar.set_tou_periods, so setup can't finish without one.
+    await page.getByPlaceholder('Huawei battery device ID').fill('1');
+
+    await expect(
+      page.getByRole('button', { name: /Next: Electricity Pricing/i }),
+    ).toBeEnabled();
+  });
+
+  // #730: Huawei (EMMA) and Solis both expose a native lifetime
+  // load-consumption entity, but the wizard's platform definitions offered no
+  // field to map it — so their users could never enable the HA Statistics
+  // consumption strategy, which needs a Recorder-tracked lifetime-consumption
+  // sensor. The Lifetime Energy group must now render the field for both.
+  test('Huawei Lifetime Energy group includes a load-consumption field', async ({
+    page,
+  }) => {
+    await page.goto('/setup');
+    await expectActiveStep(page, 1);
+
+    await page.getByRole('tab', { name: /Huawei/i }).click();
+    await expect(page.getByText('Lifetime Energy')).toBeVisible();
+    await expect(
+      page.getByText('Total Energy Consumption (EMMA)'),
+    ).toBeVisible();
+  });
+
+  test('Solis Lifetime Energy group includes a load-consumption field', async ({
+    page,
+  }) => {
+    await page.goto('/setup');
+    await expectActiveStep(page, 1);
+
+    await page.getByRole('tab', { name: /Solis Modbus/i }).click();
+    await expect(page.getByText('Lifetime Energy')).toBeVisible();
+    await expect(
+      page.getByText('Total Energy Consumption', { exact: true }),
+    ).toBeVisible();
   });
 });

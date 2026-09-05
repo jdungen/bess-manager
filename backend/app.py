@@ -13,6 +13,7 @@ import log_config as _  # noqa: F401
 # Import endpoints router
 from api import router as endpoints_router
 from api_conversion import build_system_settings
+from apscheduler.events import EVENT_JOB_MISSED
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 from fastapi import FastAPI
@@ -130,28 +131,21 @@ class BESSController:
         for section, value in self.settings_store.data.items():
             merged[section] = value
 
-        # Initialize Home Assistant API Controller with flat sensor config.
-        # The store holds per-platform structure; get_active_sensors() merges
-        # the active platform + shared into a flat dict for the controller.
-        sensor_config = self.settings_store.get_active_sensors()
+        # Initialize Home Assistant API Controller with a live settings_store
+        # reference, so ha_controller.sensors always reads the active
+        # platform's sensors directly — no manually-synced cache (#334).
         growatt_config = merged.get("growatt", {})
         growatt_device_id = growatt_config.get("device_id")
         inverter_config = merged.get("inverter", {})
         huawei_device_id = inverter_config.get("device_id")
         self.ha_controller = self._init_ha_controller(
-            sensor_config, growatt_device_id, huawei_device_id
+            self.settings_store,
+            growatt_device_id,
+            huawei_device_id,
+            self.settings_store.get_service_domain(),
+            self.settings_store.get_grid_power_polarity(),
+            self.settings_store.get_battery_power_polarity(),
         )
-
-        # Set timezone from HA config before any BESS modules use it
-        try:
-            ha_config = self.ha_controller.get_ha_config()
-            ha_timezone = ha_config["time_zone"]
-            from core.bess.time_utils import set_timezone
-
-            set_timezone(ha_timezone)
-            logger.info(f"Timezone set from HA: {ha_timezone}")
-        except Exception as e:
-            logger.warning(f"Could not read timezone from HA, using default: {e}")
 
         # Enable test mode from environment variable OR persisted demo_mode setting.
         # Environment variable takes precedence (for dev/CI use).
@@ -181,6 +175,22 @@ class BESSController:
             addon_options=merged,
         )
 
+        # Set timezone from HA config before any BESS modules use it. This
+        # runs after BatterySystemManager construction (above) so that
+        # ha_controller.failure_tracker is already wired to a real
+        # RuntimeFailureTracker — a final-attempt HA API failure here then
+        # surfaces on the existing dashboard banner instead of only being
+        # logged (#440).
+        try:
+            ha_config = self.ha_controller.get_ha_config()
+            ha_timezone = ha_config["time_zone"]
+            from core.bess.time_utils import set_timezone
+
+            set_timezone(ha_timezone)
+            logger.info(f"Timezone set from HA: {ha_timezone}")
+        except Exception as e:
+            logger.warning(f"Could not read timezone from HA, using default: {e}")
+
         # Create scheduler with increased misfire grace time to avoid unnecessary warnings
         self.scheduler = BackgroundScheduler(
             {
@@ -203,14 +213,25 @@ class BESSController:
         logger.info("BESS Controller initialized with early settings loading")
 
     def _init_ha_controller(
-        self, sensor_config, growatt_device_id=None, huawei_device_id=None
+        self,
+        settings_store,
+        growatt_device_id=None,
+        huawei_device_id=None,
+        service_domain=None,
+        grid_power_polarity=None,
+        battery_power_polarity=None,
     ):
         """Initialize Home Assistant API controller based on environment.
 
         Args:
-            sensor_config: Sensor configuration dictionary to use for the controller.
+            settings_store: Live settings store backing ha_controller.sensors.
             growatt_device_id: Growatt device ID for TOU segment operations.
             huawei_device_id: Huawei device ID for battery operations.
+            service_domain: HA integration domain for vendor service calls.
+            grid_power_polarity: Sign convention for a platform whose
+                import_power/export_power share one signed entity.
+            battery_power_polarity: Sign convention for a platform whose
+                battery charge/discharge power share one signed entity.
         """
         ha_token = os.getenv("HASSIO_TOKEN")
         if ha_token:
@@ -220,15 +241,19 @@ class BESSController:
             ha_url = os.environ.get("HA_URL", "http://supervisor/core")
 
         logger.info(
-            f"Initializing HA controller with {len(sensor_config)} sensor configurations"
+            "Initializing HA controller with %d sensor configurations",
+            len(settings_store.get_active_sensors()),
         )
 
         return HomeAssistantAPIController(
             ha_url=ha_url,
             token=ha_token,
-            sensor_config=sensor_config,
+            settings_store=settings_store,
             growatt_device_id=growatt_device_id,
             huawei_device_id=huawei_device_id,
+            service_domain=service_domain,
+            grid_power_polarity=grid_power_polarity,
+            battery_power_polarity=battery_power_polarity,
         )
 
     def _load_options(self):
@@ -258,20 +283,33 @@ class BESSController:
 
         return options
 
-    def refresh_active_sensors(self) -> None:
-        """Sync the live ha_controller.sensors map from persisted settings.
+    def refresh_service_domain(self) -> None:
+        """Sync the live ha_controller.service_domain from persisted settings.
 
-        ha_controller.sensors is a plain dict copy, not a live view of the
-        settings store — it only reflects the sensor map that was active when
-        it was last assigned. Any settings mutation that can change which
-        sensors are active (a direct sensor edit, or an inverter/growatt
-        platform switch, which selects a different per-platform sensor
-        sub-dict) must call this afterward, or the copy goes stale until the
-        next call or a process restart. This is the single place that
-        performs the sync — call sites should not reimplement it.
+        Like ha_controller.sensors, this is a plain copy taken at init — an
+        inverter platform switch changes which vendor domain the platform
+        resolves to, and an explicit inverter.service_domain override
+        changes it directly. Call this after any settings mutation that can
+        touch the inverter section, or vendor service calls keep targeting
+        the previous integration until the next restart.
         """
-        active = self.settings_store.get_active_sensors()
-        self.ha_controller.sensors = {k: v for k, v in active.items() if v}
+        self.ha_controller.service_domain = self.settings_store.get_service_domain()
+
+    def refresh_power_polarities(self) -> None:
+        """Sync both live signed-sensor polarities from persisted settings.
+
+        Like service_domain, these are plain copies taken at init — an
+        inverter platform switch changes which sign conventions (if any)
+        apply to a shared signed grid-power sensor (#475/#438) and to a
+        shared signed battery-power sensor (#542). Call this after any
+        settings mutation that can touch the inverter section.
+        """
+        self.ha_controller.grid_power_polarity = (
+            self.settings_store.get_grid_power_polarity()
+        )
+        self.ha_controller.battery_power_polarity = (
+            self.settings_store.get_battery_power_polarity()
+        )
 
     def apply_discovered_config(
         self,
@@ -298,8 +336,9 @@ class BESSController:
             huawei_device_id=huawei_device_id,
         )
 
-        # Apply to running controller so BESS starts using new sensors immediately
-        self.refresh_active_sensors()
+        # ha_controller.sensors is a live settings_store view (#334) — the
+        # settings_store.apply_discovered() call above is already enough for
+        # BESS to start using the newly discovered sensors immediately.
         if growatt_device_id:
             self.ha_controller.growatt_device_id = growatt_device_id
         if huawei_device_id:
@@ -325,6 +364,26 @@ class BESSController:
         self._init_scheduler_jobs()
         logger.info("Scheduler started")
 
+    def _on_job_missed(self, event) -> None:
+        """Surface a coalesced scheduler misfire that would otherwise be silent.
+
+        APScheduler's default coalesce=True drops a missed fire time with no
+        log line at all (issue #403) — for update_schedule_quarterly this
+        permanently lost a period's actuals with no trace it ever happened.
+        Scoped to that job only; other jobs' misfires are not this issue.
+        """
+        if event.job_id != "update_schedule_quarterly":
+            return
+        logger.warning(
+            f"Scheduled job '{event.job_id}' missed its "
+            f"{event.scheduled_run_time:%H:%M} run — previous run still busy, "
+            "misfire coalesced away"
+        )
+        self.system.record_scheduler_misfire(
+            job_id=event.job_id,
+            scheduled_run_time=event.scheduled_run_time,
+        )
+
     def _init_scheduler_jobs(self):
         """Configure scheduler jobs."""
 
@@ -337,7 +396,22 @@ class BESSController:
         self.scheduler.add_job(
             update_schedule_quarterly,
             CronTrigger(minute="0,15,30,45"),
+            id="update_schedule_quarterly",
             misfire_grace_time=30,  # Allow 30 seconds of misfire before warning
+        )
+        self.scheduler.add_listener(self._on_job_missed, EVENT_JOB_MISSED)
+
+        # Electricity price cache refresh (every 15 minutes, offset from the
+        # optimizer's :00/:15/:30/:45 so the quarterly cycle always reads a
+        # cache populated ~5 min earlier and never races the fetch). Fetching
+        # lives here, off the scheduler's hardware-control path, so a slow or
+        # 500-ing HA price integration can no longer delay or skip a period
+        # switch (#709). The job is a no-op once each day's prices are cached.
+        self.scheduler.add_job(
+            self.system.refresh_prices,
+            CronTrigger(minute="5,20,35,50"),
+            id="refresh_prices",
+            misfire_grace_time=30,
         )
 
         # Next day preparation (daily at 23:55)

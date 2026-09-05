@@ -11,7 +11,6 @@
       "max_charge_power_kw": 15.0,
       "max_discharge_power_kw": 15.0,
       "cycle_cost_per_kwh": 0.4,
-      "min_action_profit_threshold": 0.0,
       "efficiency_charge": 0.97,
       "efficiency_discharge": 0.95
     },
@@ -1320,7 +1319,7 @@
   },
   "expected_wizard": {
     "growatt_cloud_3phase": {
-      "_comment": "Growatt SPH via cloud + Octopus Energy pricing. UK 3-phase user (xyz9876543 device). Covers phase_count=3 and power_monitoring_enabled=true path.",
+      "_comment": "Growatt SPH via cloud + Octopus Energy pricing. UK 3-phase user (xyz9876543 device). Covers phase_count=3. Growatt SPH has no battery_charging_power_rate sensor, so power monitoring cannot be enabled on this platform (see HomeFormSection.tsx's chargeRateSensorConfigured gate) — powerMonitoringEnabled stays false here even though phase-current sensors are mapped.",
       "payload": {
         "sensors": {
           "battery_soc": "sensor.xyz9876543_state_of_charge",
@@ -1334,7 +1333,10 @@
           "lifetime_solar_energy": "sensor.xyz9876543_lifetime_solar_energy",
           "lifetime_import_from_grid": "sensor.xyz9876543_lifetime_import_from_grid",
           "lifetime_export_to_grid": "sensor.xyz9876543_lifetime_export_to_grid",
-          "lifetime_load_consumption": "sensor.xyz9876543_lifetime_load_consumption"
+          "lifetime_load_consumption": "sensor.xyz9876543_lifetime_load_consumption",
+          "current_l1": "sensor.xyz9876543_current_l1",
+          "current_l2": "sensor.xyz9876543_current_l2",
+          "current_l3": "sensor.xyz9876543_current_l3"
         },
         "growattDeviceId": "dev-growatt-xyz",
         "totalCapacity": 10.0,
@@ -1342,7 +1344,6 @@
         "maxSoc": 95.0,
         "maxChargeDischargePower": 5.0,
         "cycleCost": 0.5,
-        "minActionProfitThreshold": 0.0,
         "currency": "GBP",
         "consumption": 4.0,
         "consumptionStrategy": "fixed",
@@ -1350,7 +1351,7 @@
         "voltage": 230,
         "safetyMarginFactor": 1.0,
         "phaseCount": 3,
-        "powerMonitoringEnabled": true,
+        "powerMonitoringEnabled": false,
         "markupRate": 0.0,
         "vatMultiplier": 1.0,
         "additionalCosts": 0.0,
@@ -1377,7 +1378,7 @@
         "home": {
           "currency": "GBP",
           "phase_count": 3,
-          "power_monitoring_enabled": true
+          "power_monitoring_enabled": false
         },
         "electricity_price": {
           "vat_multiplier": 1.0,
@@ -1395,7 +1396,10 @@
         },
         "sensors": {
           "battery_soc": "sensor.xyz9876543_state_of_charge",
-          "pv_power": "sensor.xyz9876543_all_pv_wattage"
+          "pv_power": "sensor.xyz9876543_all_pv_wattage",
+          "current_l1": "sensor.xyz9876543_current_l1",
+          "current_l2": "sensor.xyz9876543_current_l2",
+          "current_l3": "sensor.xyz9876543_current_l3"
         }
       },
       "expected_absent_sections": [],
@@ -1428,7 +1432,6 @@
         "maxSoc": 100.0,
         "maxChargeDischargePower": 15.0,
         "cycleCost": 0.4,
-        "minActionProfitThreshold": 0.0,
         "currency": "GBP",
         "consumption": 4.6,
         "consumptionStrategy": "fixed",

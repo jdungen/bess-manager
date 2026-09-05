@@ -4,7 +4,7 @@ updated to the target behaviour in Task 2/3 (the change is intentional)."""
 
 from core.bess.dp_battery_algorithm import _compute_reward, _state_transition
 from core.bess.models import EnergyData
-from core.bess.tests.helpers import make_battery_settings
+from core.bess.tests.helpers import flows_for, make_battery_settings
 
 DT = 0.25
 PRICES_BUY = [1.0]
@@ -22,7 +22,7 @@ def test_idle_passively_charges_from_solar_surplus():
     expected_stored = 1.4 * bs.efficiency_charge  # 1.4 * 0.97 = 1.358
     assert round(next_soe - 5.0, 4) == round(expected_stored, 4)
 
-    reward, _ = _compute_reward(
+    reward, _, _ = _compute_reward(
         power=0.0,
         soe=5.0,
         next_soe=next_soe,
@@ -50,7 +50,7 @@ def test_idle_exports_when_battery_full():
     )
     assert next_soe == full_soe  # battery full, cannot charge
 
-    reward, _ = _compute_reward(
+    reward, _, _ = _compute_reward(
         power=0.0,
         soe=full_soe,
         next_soe=full_soe,
@@ -87,7 +87,7 @@ def test_store_action_charges_at_max_rate_solar_plus_grid():
         f"but got {next_soe - 5.0:.4f} kWh"
     )
 
-    reward, _ = _compute_reward(
+    reward, _, _ = _compute_reward(
         power=0.4,
         soe=5.0,
         next_soe=next_soe,
@@ -116,6 +116,7 @@ def test_build_period_data_store_disposition_flows():
         5.0, 0.4, bs, DT, solar_production=1.5, home_consumption=0.1
     )
     pd = _build_period_data(
+        flows=flows_for(0.4, 5.0, nxt, 0.1, 1.5, bs, DT),
         power=0.4,
         soe=5.0,
         next_soe=nxt,
@@ -147,7 +148,7 @@ def test_build_period_data_store_disposition_flows():
 
 
 def test_idle_with_solar_surplus_classifies_as_solar_export():
-    from core.bess.decision_intelligence import classify_strategic_intent
+    from core.bess.strategic_intent import classify_strategic_intent
 
     # power 0, battery full (no passive charging), surplus exported → SOLAR_EXPORT
     ed = EnergyData(
@@ -231,6 +232,9 @@ def test_store_with_surplus_draws_grid_to_fill_remaining_rate():
     )
 
     pd = _build_period_data(
+        flows=flows_for(
+            power, 5.0, next_soe, home_consumption, solar_production, bs, DT
+        ),
         power=power,
         soe=5.0,
         next_soe=next_soe,
@@ -322,6 +326,7 @@ def test_grid_charging_action_reports_achieved_throughput_not_tied_power():
         soe, tied_power, bs, DT, solar_production=0.0, home_consumption=0.0
     )
     pd = _build_period_data(
+        flows=flows_for(tied_power, soe, next_soe, 0.0, 0.0, bs, DT),
         power=tied_power,
         soe=soe,
         next_soe=next_soe,
@@ -348,7 +353,7 @@ def test_small_solar_surplus_at_idle_classifies_as_solar_export():
     """A power-0 period with solar surplus classifies as SOLAR_EXPORT (load_first).
     grid_first is only for active battery discharge — idle periods must use
     load_first so the battery can support house load when solar is insufficient."""
-    from core.bess.decision_intelligence import classify_strategic_intent
+    from core.bess.strategic_intent import classify_strategic_intent
 
     ed = EnergyData(
         solar_production=0.3,
@@ -465,7 +470,7 @@ def test_discharge_no_longer_blocked_by_cost_basis_floor_issue_204():
         soe, power, bs, DT, solar_production=0.893, home_consumption=0.155
     )
 
-    reward, _ = _compute_reward(
+    reward, _, _ = _compute_reward(
         power=power,
         soe=soe,
         next_soe=next_soe,
@@ -505,7 +510,7 @@ def test_small_discharge_still_evaluated_without_profitability_floor():
         capacity_after_discharge < 0.1
     )  # confirms this is the smaller-action edge case
 
-    reward, _ = _compute_reward(
+    reward, _, _ = _compute_reward(
         power=power,
         soe=soe,
         next_soe=next_soe,
@@ -545,7 +550,7 @@ def test_discharge_not_blocked_when_solar_does_not_cover_load():
         home_consumption=home_consumption,
     )
 
-    reward, _ = _compute_reward(
+    reward, _, _ = _compute_reward(
         power=power,
         soe=soe,
         next_soe=next_soe,

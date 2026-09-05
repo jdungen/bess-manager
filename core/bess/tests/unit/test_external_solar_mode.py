@@ -1,9 +1,13 @@
 """Tests for the AC-coupled `external_solar_mode` battery setting.
 
 When enabled, the SOLAR_STORAGE strategic intent must translate to
-`grid_charge=True` so the battery can AC-charge from surplus solar that
-returns via the meter (the battery inverter has no DC solar input).
-All other intents must keep their default mapping.
+`grid_charge=True` and `battery_first` so the battery can AC-charge from
+surplus solar that returns via the meter (the battery inverter has no DC
+solar input). All other intents must keep their default mapping.
+
+The mode assertions use GrowattMinController because it is a
+`tou_register` platform — the only control model that carries a
+`batt_mode` field (see `InverterController._mode_display_fields`).
 """
 
 import pytest
@@ -11,7 +15,6 @@ import pytest
 from core.bess.growatt_min_controller import GrowattMinController
 from core.bess.growatt_sph_controller import GrowattSphController
 from core.bess.settings import BatterySettings
-from core.bess.solax_controller import SolaxController
 
 
 def _settings(*, external_solar_mode: bool) -> BatterySettings:
@@ -25,18 +28,24 @@ def _settings(*, external_solar_mode: bool) -> BatterySettings:
     )
 
 
+def _min_controller(*, external_solar_mode: bool) -> GrowattMinController:
+    return GrowattMinController(
+        battery_settings=_settings(external_solar_mode=external_solar_mode)
+    )
+
+
 class TestExternalSolarModeOverride:
     def test_default_is_disabled(self) -> None:
         assert BatterySettings(total_capacity=10.0).external_solar_mode is False
 
     def test_solar_storage_grid_charge_false_when_disabled(self) -> None:
-        ctrl = SolaxController(battery_settings=_settings(external_solar_mode=False))
+        ctrl = _min_controller(external_solar_mode=False)
         grid_charge, discharge_rate = ctrl._map_intent_to_rates("SOLAR_STORAGE", 0.0)
         assert grid_charge is False
         assert discharge_rate == 0
 
     def test_solar_storage_grid_charge_true_when_enabled(self) -> None:
-        ctrl = SolaxController(battery_settings=_settings(external_solar_mode=True))
+        ctrl = _min_controller(external_solar_mode=True)
         grid_charge, discharge_rate = ctrl._map_intent_to_rates("SOLAR_STORAGE", 0.0)
         assert grid_charge is True
         assert discharge_rate == 0
@@ -53,12 +62,12 @@ class TestExternalSolarModeOverride:
     def test_other_intents_unaffected_when_enabled(
         self, intent: str, expected_grid_charge: bool
     ) -> None:
-        ctrl = SolaxController(battery_settings=_settings(external_solar_mode=True))
+        ctrl = _min_controller(external_solar_mode=True)
         grid_charge, _ = ctrl._map_intent_to_rates(intent, 0.0)
         assert grid_charge is expected_grid_charge
 
     def test_detailed_period_groups_apply_override(self) -> None:
-        ctrl = SolaxController(battery_settings=_settings(external_solar_mode=True))
+        ctrl = _min_controller(external_solar_mode=True)
         ctrl.strategic_intents = ["SOLAR_STORAGE"] * 96
         groups = ctrl.get_detailed_period_groups()
         assert groups, "expected at least one period group"
@@ -67,16 +76,15 @@ class TestExternalSolarModeOverride:
             assert group["intent"] == "SOLAR_STORAGE"
 
     def test_detailed_period_groups_no_override_when_disabled(self) -> None:
-        ctrl = SolaxController(battery_settings=_settings(external_solar_mode=False))
+        ctrl = _min_controller(external_solar_mode=False)
         ctrl.strategic_intents = ["SOLAR_STORAGE"] * 96
         groups = ctrl.get_detailed_period_groups()
         for group in groups:
             assert group["grid_charge"] is False
 
-    def test_get_period_settings_applies_override_without_schedule(self) -> None:
-        ctrl = SolaxController(battery_settings=_settings(external_solar_mode=True))
+    def test_period_settings_apply_override(self) -> None:
+        ctrl = _min_controller(external_solar_mode=True)
         ctrl.strategic_intents = ["SOLAR_STORAGE"] * 96
-        ctrl.current_schedule = None
         settings = ctrl.get_period_settings(period=10)
         assert settings["grid_charge"] is True
         assert settings["strategic_intent"] == "SOLAR_STORAGE"
@@ -92,13 +100,13 @@ class TestExternalSolarModeBattModeOverride:
     """
 
     def test_solar_storage_mode_is_load_first_when_disabled(self) -> None:
-        ctrl = SolaxController(battery_settings=_settings(external_solar_mode=False))
+        ctrl = _min_controller(external_solar_mode=False)
         ctrl.strategic_intents = ["SOLAR_STORAGE"] * 96
         settings = ctrl.get_period_settings(period=10)
         assert settings["batt_mode"] == "load_first"
 
     def test_solar_storage_mode_is_battery_first_when_enabled(self) -> None:
-        ctrl = SolaxController(battery_settings=_settings(external_solar_mode=True))
+        ctrl = _min_controller(external_solar_mode=True)
         ctrl.strategic_intents = ["SOLAR_STORAGE"] * 96
         settings = ctrl.get_period_settings(period=10)
         assert settings["batt_mode"] == "battery_first"
@@ -115,18 +123,18 @@ class TestExternalSolarModeBattModeOverride:
     def test_other_intents_unaffected_when_enabled(
         self, intent: str, expected_mode: str
     ) -> None:
-        ctrl = SolaxController(battery_settings=_settings(external_solar_mode=True))
+        ctrl = _min_controller(external_solar_mode=True)
         ctrl.strategic_intents = [intent] * 96
         settings = ctrl.get_period_settings(period=10)
         assert settings["batt_mode"] == expected_mode
 
     def test_detailed_period_groups_apply_mode_override(self) -> None:
-        ctrl = SolaxController(battery_settings=_settings(external_solar_mode=True))
+        ctrl = _min_controller(external_solar_mode=True)
         ctrl.strategic_intents = ["SOLAR_STORAGE"] * 96
         groups = ctrl.get_detailed_period_groups()
         assert groups, "expected at least one period group"
         for group in groups:
-            assert group["mode"] == "battery_first"
+            assert group["batt_mode"] == "battery_first"
             assert group["grid_charge"] is True
 
 
@@ -139,9 +147,7 @@ class TestExternalSolarModeGrowattMinTouPath:
     """
 
     def _controller(self, *, external_solar_mode: bool) -> GrowattMinController:
-        ctrl = GrowattMinController(
-            battery_settings=_settings(external_solar_mode=external_solar_mode)
-        )
+        ctrl = _min_controller(external_solar_mode=external_solar_mode)
         ctrl.strategic_intents = ["IDLE"] * 40 + ["SOLAR_STORAGE"] * 16 + ["IDLE"] * 40
         return ctrl
 

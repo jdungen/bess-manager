@@ -6,11 +6,12 @@ in _aggregate_quarterly_to_hourly.
 """
 
 import sys
+from dataclasses import replace
 from datetime import date, datetime, timedelta
 from unittest.mock import MagicMock
 
 import pytest
-from api import router
+from api import _aggregate_quarterly_to_hourly, router
 from api_dataclasses import APIDashboardHourlyData, APIDashboardSummary
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -18,6 +19,7 @@ from fastapi.testclient import TestClient
 from core.bess import time_utils
 from core.bess.battery_system_manager import BatterySystemManager
 from core.bess.daily_view_builder import DailyView
+from core.bess.exceptions import SystemConfigurationError
 from core.bess.models import DecisionData, EconomicData, EnergyData, PeriodData
 
 _test_app = FastAPI()
@@ -149,6 +151,7 @@ def _make_started_controller() -> MagicMock:
     sm.get_all_tou_segments.return_value = []
     sm.tou_intervals = []
 
+    ctrl.ha_controller.get_device_maps.return_value = ({}, {})
     ctrl.ha_controller.get_battery_soc.return_value = 75.0
     ctrl.ha_controller.get_pv_power.return_value = 0.0
     ctrl.ha_controller.get_local_load_power.return_value = 0.0
@@ -336,6 +339,102 @@ class TestDashboardAvailableDates:
         assert resp.status_code == 503
 
 
+def test_aggregate_hourly_uses_observed_intent_from_all_quarters_not_just_last():
+    """Regression test for #486.
+
+    The per-quarter observedIntent captures real execution, but the old
+    aggregation only forwarded the *last* quarter's observedIntent, so if
+    the last quarter's observed execution disagreed with the other 3
+    (all genuinely recorded as "actual"), the majority's real outcome was
+    silently discarded in favor of that one quarter's value.
+    """
+    quarters = []
+    for i in range(4):
+        period = _make_period(i)
+        # All 4 quarters genuinely executed and were recorded as actual;
+        # 3 of them ran LOAD_SUPPORT, only the last ran BATTERY_EXPORT.
+        period = replace(
+            period,
+            data_source="actual",
+            decision=DecisionData(
+                strategic_intent="BATTERY_EXPORT",
+                observed_intent="BATTERY_EXPORT" if i == 3 else "LOAD_SUPPORT",
+            ),
+        )
+        quarters.append(
+            APIDashboardHourlyData.from_internal(
+                period, battery_capacity=15.0, currency="SEK"
+            )
+        )
+
+    [hourly] = _aggregate_quarterly_to_hourly(quarters, 15.0, "SEK")
+
+    # dataSource stays tied to the last quarter (unchanged) — it feeds
+    # actualSavingsSoFar/predictedRemainingSavings bucketing and must not
+    # be widened to "any quarter actual", or a still-predicted quarter's
+    # cost gets counted as realized.
+    assert hourly.dataSource == "actual"
+    assert hourly.observedIntent == "LOAD_SUPPORT"
+
+
+def test_aggregate_hourly_data_source_stays_last_quarter_even_if_earlier_quarters_are_actual():
+    """dataSource must not flip to "actual" just because SOME quarter is —
+    only the last quarter's value counts, matching the pre-existing contract
+    that api_dataclasses.py's actual/predicted savings split relies on.
+    """
+    quarters = []
+    for i in range(4):
+        period = _make_period(i)
+        period = replace(
+            period,
+            data_source="actual" if i < 3 else "predicted",
+            decision=DecisionData(
+                strategic_intent="LOAD_SUPPORT",
+                observed_intent="LOAD_SUPPORT" if i < 3 else None,
+            ),
+        )
+        quarters.append(
+            APIDashboardHourlyData.from_internal(
+                period, battery_capacity=15.0, currency="SEK"
+            )
+        )
+
+    [hourly] = _aggregate_quarterly_to_hourly(quarters, 15.0, "SEK")
+
+    assert hourly.dataSource == "predicted"
+
+
+def test_aggregate_hourly_curtailed_not_filtered_by_dominant_intent():
+    """Curtailment (#501) is intent-independent: a curtailed quarter can
+    classify as SOLAR_STORAGE (battery charging at rate limit, surplus above
+    it curtailed). An hour whose curtailed quarters lose the dominant-intent
+    vote must still report curtailed=True.
+    """
+    quarters = []
+    for i in range(4):
+        period = _make_period(i)
+        # 2 GRID_CHARGING + 2 curtailed SOLAR_STORAGE quarters: the 2-2 tie
+        # resolves to GRID_CHARGING on priority, so any intent-filtered
+        # aggregation would look only at the un-curtailed quarters.
+        period = replace(
+            period,
+            decision=DecisionData(
+                strategic_intent="GRID_CHARGING" if i < 2 else "SOLAR_STORAGE",
+                curtailed=i >= 2,
+            ),
+        )
+        quarters.append(
+            APIDashboardHourlyData.from_internal(
+                period, battery_capacity=15.0, currency="SEK"
+            )
+        )
+
+    [hourly] = _aggregate_quarterly_to_hourly(quarters, 15.0, "SEK")
+
+    assert hourly.strategicIntent == "GRID_CHARGING"
+    assert hourly.curtailed is True
+
+
 def test_net_grid_cost_excludes_battery_wear():
     def _hour(grid_cost, cycle_cost):
         return APIDashboardHourlyData.from_internal(
@@ -438,23 +537,6 @@ def test_from_totals_computes_net_savings_as_grid_only_minus_net_grid():
 
 
 # ===========================================================================
-# GET /api/decision-intelligence
-# ===========================================================================
-
-
-class TestDecisionIntelligence:
-    def test_returns_200(self):
-        sys.modules["app"].bess_controller = _make_started_controller()
-        resp = _client.get("/api/decision-intelligence")
-        assert resp.status_code == 200
-
-    def test_unconfigured_returns_503(self):
-        sys.modules["app"].bess_controller = _unconfigured_controller()
-        resp = _client.get("/api/decision-intelligence")
-        assert resp.status_code == 503
-
-
-# ===========================================================================
 # GET /api/growatt/tou_settings
 # ===========================================================================
 
@@ -551,7 +633,7 @@ class TestDashboardHealthSummary:
         resp = _client.get("/api/dashboard-health-summary")
         assert resp.status_code == 503
 
-    def test_critical_issue_names_the_failing_sensor(self):
+    def test_critical_issue_names_the_failing_component(self):
         ctrl = _make_started_controller()
         ctrl.system.has_critical_sensor_failures.return_value = True
         ctrl.system.get_critical_sensor_failures.return_value = ["Battery Control"]
@@ -578,9 +660,125 @@ class TestDashboardHealthSummary:
         resp = _client.get("/api/dashboard-health-summary")
 
         issue = resp.json()["criticalIssues"][0]
-        assert issue["detail"] == (
-            "Battery Charging Power Rate (number.growatt_battery_charging_power_rate)"
+        # Without a resolvable device the component name is the group key,
+        # and detail names the component rather than its individual sensors.
+        assert issue["detail"] == "Battery Control"
+
+    def test_critical_issues_grouped_by_device(self) -> None:
+        """A single-device outage (three components, two devices) shows one
+        banner line per device, not one per component."""
+        ctrl = _make_started_controller()
+        ctrl.system.has_critical_sensor_failures.return_value = True
+        ctrl.system.get_critical_sensor_failures.return_value = [
+            "Battery Control",
+            "Battery Monitoring",
+            "Energy Monitoring",
+        ]
+        ctrl.system.get_cached_health_results.return_value = {
+            "checks": [
+                {
+                    "name": "Battery Control",
+                    "status": "ERROR",
+                    "required": True,
+                    "checks": [
+                        {
+                            "name": "Power Setpoint",
+                            "entity_id": "sensor.device_a_sensor",
+                            "status": "ERROR",
+                        }
+                    ],
+                },
+                {
+                    "name": "Battery Monitoring",
+                    "status": "ERROR",
+                    "required": True,
+                    "checks": [
+                        {
+                            "name": "Battery SOC",
+                            "entity_id": "sensor.device_b_sensor",
+                            "status": "ERROR",
+                        }
+                    ],
+                },
+                {
+                    "name": "Energy Monitoring",
+                    "status": "ERROR",
+                    "required": True,
+                    "checks": [
+                        {
+                            "name": "Energy Today",
+                            "entity_id": "sensor.device_c_sensor",
+                            "status": "ERROR",
+                        }
+                    ],
+                },
+            ],
+            "system_mode": "degraded",
+        }
+        ctrl.ha_controller.get_device_maps.return_value = (
+            {
+                "sensor.device_a_sensor": "device-a",
+                "sensor.device_b_sensor": "device-a",
+                "sensor.device_c_sensor": "device-b",
+            },
+            {"device-a": "Power Inverter", "device-b": "Energy Meter"},
         )
+        # Direct assignment matches the rest of this file; the mypy
+        # attr-defined is pre-existing ratchet debt, so suppress it here
+        # rather than add another occurrence.
+        sys.modules["app"].bess_controller = ctrl  # type: ignore[attr-defined]
+
+        resp = _client.get("/api/dashboard-health-summary")
+
+        issues = resp.json()["criticalIssues"]
+        assert len(issues) == 2
+        assert issues[0]["component"] == "Power Inverter"
+        assert issues[0]["detail"] == "Battery Control, Battery Monitoring"
+        assert issues[1]["component"] == "Energy Meter"
+        assert issues[1]["detail"] == "Energy Monitoring"
+        assert resp.json()["totalCriticalIssues"] == 2
+
+    def test_critical_issues_group_by_component_when_registry_unavailable(
+        self,
+    ) -> None:
+        """A registry query failure must not drop the critical banner — it
+        degrades to component-name grouping, one line per failing component."""
+        ctrl = _make_started_controller()
+        ctrl.system.has_critical_sensor_failures.return_value = True
+        ctrl.system.get_critical_sensor_failures.return_value = [
+            "Battery Control",
+            "Battery Monitoring",
+        ]
+        ctrl.system.get_cached_health_results.return_value = {
+            "checks": [
+                {
+                    "name": "Battery Control",
+                    "status": "ERROR",
+                    "required": True,
+                    "checks": [],
+                },
+                {
+                    "name": "Battery Monitoring",
+                    "status": "ERROR",
+                    "required": True,
+                    "checks": [],
+                },
+            ]
+        }
+        ctrl.ha_controller.get_device_maps.side_effect = SystemConfigurationError(
+            "registry down"
+        )
+        sys.modules["app"].bess_controller = ctrl  # type: ignore[attr-defined]
+
+        resp = _client.get("/api/dashboard-health-summary")
+
+        issues = resp.json()["criticalIssues"]
+        assert len(issues) == 2
+        assert {i["component"] for i in issues} == {
+            "Battery Control",
+            "Battery Monitoring",
+        }
+        assert resp.json()["totalCriticalIssues"] == 2
 
 
 # ===========================================================================
@@ -609,10 +807,22 @@ class TestHistoricalDataStatus:
         resp = _client.post("/api/historical-data-status/dismiss")
         assert resp.status_code == 503
 
-    def test_dismiss_persists_across_requests(self):
+    def test_dismiss_persists_across_requests(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         """A dismissal for today's missing hours suppresses the banner on
         the next GET, matching the runtime-failures/health-recoveries
         dismiss-then-refetch pattern the frontend relies on."""
+        # Freeze the clock to a non-boundary hour. The endpoint only expects
+        # periods before the current hour (current_period = hour * 4), so at
+        # 00:xx current_period == 0 and is_incomplete is False — the dismissal
+        # can never show as active, and the test would deterministically fail
+        # for one wall-clock hour each day.
+
+        def _fixed_now() -> datetime:
+            return datetime(2026, 1, 15, 14, 30, tzinfo=time_utils.TIMEZONE)
+
+        monkeypatch.setattr(time_utils, "now", _fixed_now)
         ctrl = _make_started_controller()
         system = BatterySystemManager.__new__(BatterySystemManager)
         system._dismissed_historical_warning_signature = None
@@ -708,6 +918,43 @@ class TestSnapshotComparison:
             "/api/prediction-analysis/snapshot-comparison?period_a=0&period_b=10"
         )
         assert resp.status_code == 503
+
+    def test_handles_vpp_schedule_without_batt_mode(self):
+        """Task 6-8 controllers may emit growatt_schedule intervals that carry
+        vpp_power_pct/vpp_remote_control instead of batt_mode. The endpoint
+        must not KeyError on interval["batt_mode"] for those intervals.
+        """
+        ctrl = _make_started_controller()
+
+        vpp_interval = {
+            "start_time": "00:00",
+            "end_time": "01:00",
+            "vpp_power_pct": 0,
+            "vpp_remote_control": True,
+        }
+
+        def make_snapshot(period: int):
+            snapshot = MagicMock()
+            snapshot.snapshot_timestamp = datetime(
+                2025, 7, 13, 0, 0, tzinfo=time_utils.TIMEZONE
+            )
+            snapshot.daily_view = _make_daily_view()
+            snapshot.growatt_schedule = [vpp_interval]
+            return snapshot
+
+        ctrl.system.prediction_snapshot_store.get_snapshot_at_period.side_effect = (
+            lambda period: make_snapshot(period)
+        )
+
+        sys.modules["app"].bess_controller = ctrl
+        resp = _client.get(
+            "/api/prediction-analysis/snapshot-comparison?period_a=0&period_b=10"
+        )
+        assert resp.status_code == 200  # must not 500/KeyError
+        schedule_a = resp.json()["growattScheduleA"]
+        assert schedule_a
+        assert "vppPowerPct" in schedule_a[0] or "battMode" in schedule_a[0]
+        assert "battMode" not in schedule_a[0]
 
 
 # ===========================================================================

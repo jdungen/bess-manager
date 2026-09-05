@@ -11,7 +11,6 @@
       "max_charge_power_kw": 15.0,
       "max_discharge_power_kw": 15.0,
       "cycle_cost_per_kwh": 0.4,
-      "min_action_profit_threshold": 0.0,
       "efficiency_charge": 0.97,
       "efficiency_discharge": 0.95
     },
@@ -204,19 +203,22 @@
     "sensor.growatt_inverter_solax_grid_current_l1": {
       "state": "3.5",
       "attributes": {
-        "unit_of_measurement": "A"
+        "unit_of_measurement": "A",
+        "device_class": "current"
       }
     },
     "sensor.growatt_inverter_solax_grid_current_l2": {
       "state": "4.1",
       "attributes": {
-        "unit_of_measurement": "A"
+        "unit_of_measurement": "A",
+        "device_class": "current"
       }
     },
     "sensor.growatt_inverter_solax_grid_current_l3": {
       "state": "3.8",
       "attributes": {
-        "unit_of_measurement": "A"
+        "unit_of_measurement": "A",
+        "device_class": "current"
       }
     },
     "sensor.growatt_inverter_cloud_state_of_charge_soc": {
@@ -871,7 +873,6 @@
         "maxSoc": 100.0,
         "maxChargeDischargePower": 15.0,
         "cycleCost": 0.4,
-        "minActionProfitThreshold": 0.0,
         "currency": "SEK",
         "consumption": 4.6,
         "consumptionStrategy": "fixed",
@@ -974,7 +975,6 @@
         "maxSoc": 100.0,
         "maxChargeDischargePower": 15.0,
         "cycleCost": 0.4,
-        "minActionProfitThreshold": 0.0,
         "currency": "SEK",
         "consumption": 4.6,
         "consumptionStrategy": "fixed",

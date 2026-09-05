@@ -24,6 +24,16 @@ class FormattedValue:
     text: str
 
 
+def _fixed(value: float, prec: int, thousands: bool = False) -> str:
+    """Format `value` to `prec` decimals, never as "-0.00" for a value that
+    rounds to zero (e.g. a curtailed period's tiny FP-noise export revenue,
+    round(-0.0004, 2) == -0.0). round() preserves the sign of a negative
+    value that rounds to zero; adding 0.0 to that result normalizes -0.0 to
+    0.0 per IEEE 754, before the string ever gets built."""
+    rounded = round(value, prec) + 0.0
+    return f"{rounded:,.{prec}f}" if thousands else f"{rounded:.{prec}f}"
+
+
 def create_formatted_value(
     value: float, unit_type: str, currency: str, precision: int | None = None
 ) -> FormattedValue:
@@ -37,44 +47,47 @@ def create_formatted_value(
     """
     if unit_type == "currency":
         prec = precision if precision is not None else 2
+        display = _fixed(value, prec, thousands=True)
         return FormattedValue(
             value=value,
-            display=f"{value:,.{prec}f}",
+            display=display,
             unit=currency,
-            text=f"{value:,.{prec}f} {currency}",
+            text=f"{display} {currency}",
         )
     elif unit_type == "energy_kwh_only":
         # Always use kWh units to ensure consistency in savings view
         # Small values like 0.2 kWh should remain as "0.2 kWh", not "200 Wh"
         prec = precision if precision is not None else 1
+        display = _fixed(value, prec)
         return FormattedValue(
             value=value,
-            display=f"{value:.{prec}f}",
+            display=display,
             unit="kWh",
-            text=f"{value:.{prec}f} kWh",
+            text=f"{display} kWh",
         )
     elif unit_type == "percentage":
         prec = precision if precision is not None else 0
+        display = _fixed(value, prec)
         return FormattedValue(
             value=value,
-            display=f"{value:.{prec}f}",
+            display=display,
             unit="%",
-            text=f"{value:.{prec}f} %",
+            text=f"{display} %",
         )
     elif unit_type == "price":
         prec = precision if precision is not None else 2
         price_unit = f"{currency}/kWh"
+        display = _fixed(value, prec)
         return FormattedValue(
             value=value,
-            display=f"{value:.{prec}f}",
+            display=display,
             unit=price_unit,
-            text=f"{value:.{prec}f} {price_unit}",
+            text=f"{display} {price_unit}",
         )
     else:
         # Default fallback
-        return FormattedValue(
-            value=value, display=f"{value:.2f}", unit="", text=f"{value:.2f}"
-        )
+        display = _fixed(value, 2)
+        return FormattedValue(value=value, display=display, unit="", text=display)
 
 
 @dataclass
@@ -416,6 +429,11 @@ class APIDashboardHourlyData:
     # Raw values for logic only
     strategicIntent: str
     observedIntent: str | None
+    # Planned PV curtailment (#501): true when this period's SOLAR_EXPORT
+    # is curtailment (grid_exported > 0, sell_price below the export
+    # curtailment floor while curtailment is active), not a genuine
+    # profitable export. See core/bess/models.py DecisionData.curtailed.
+    curtailed: bool
     directSolar: float
 
     @classmethod
@@ -558,6 +576,7 @@ class APIDashboardHourlyData:
             # Raw values for logic
             strategicIntent=hourly.decision.strategic_intent,
             observedIntent=hourly.decision.observed_intent,
+            curtailed=hourly.decision.curtailed,
             directSolar=direct_solar,
         )
 
@@ -1053,6 +1072,9 @@ class APIRealTimePower:
 # user-defined entity IDs with uppercase letters in the object_id part).
 _ENTITY_ID_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9_]*\.[a-zA-Z0-9_-]+$")
 
+# Home Assistant integration domain (the "sensor" in "sensor.foo").
+_HA_DOMAIN_RE = re.compile(r"^[a-z][a-z0-9_]*$")
+
 
 @dataclass
 class APIStrategyForecast:
@@ -1105,7 +1127,6 @@ class APISetupCompletePayload(BaseModel):
     maxSoc: float | None = None
     maxChargeDischargePower: float | None = None
     cycleCost: float | None = None
-    minActionProfitThreshold: float | None = None
     externalSolarMode: bool | None = None
     # Home settings
     currency: str | None = None
@@ -1116,6 +1137,7 @@ class APISetupCompletePayload(BaseModel):
     safetyMarginFactor: float | None = None
     phaseCount: int | None = None
     powerMonitoringEnabled: bool | None = None
+    managedLoadSensors: list[str] | None = None
     # Electricity price settings
     area: str | None = None
     markupRate: float | None = None
@@ -1141,8 +1163,26 @@ class APISetupCompletePayload(BaseModel):
     # Growatt-via-solax_modbus control strategy ("tou" or "vpp"); ignored by
     # other platforms and forced to "vpp" server-side for GEN3.
     inverterControlMode: str | None = None
+    # HA integration domain for vendor service calls (set_tou_periods,
+    # update_time_segment, ...). Empty means the platform's standard domain
+    # (huawei_solar / growatt_server); set it only for an integration that
+    # exposes the same services under a different domain name.
+    inverterServiceDomain: str | None = None
     # Control mode
     demoMode: bool | None = None
+
+    @field_validator("inverterServiceDomain")
+    @classmethod
+    def validate_service_domain(cls, domain: str | None) -> str | None:
+        """Reject anything that isn't an HA integration domain.
+
+        This value is interpolated into the /api/services/<domain>/<service>
+        path, so a malformed one produces a confusing 404 from HA rather
+        than a clear configuration error here.
+        """
+        if domain and not _HA_DOMAIN_RE.match(domain):
+            raise ValueError(f"Invalid Home Assistant integration domain: {domain!r}")
+        return domain
 
     @field_validator("sensors")
     @classmethod

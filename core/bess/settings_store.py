@@ -49,6 +49,7 @@ SHARED_SENSOR_KEYS = frozenset(
         "solar_forecast_today",
         "solar_forecast_tomorrow",
         "48h_avg_grid_import",
+        "consumption_overlay",
         "current_l1",
         "current_l2",
         "current_l3",
@@ -63,30 +64,144 @@ SHARED_SENSOR_KEYS = frozenset(
 # real choice (see issue #118).
 VALID_CONTROL_MODES = ("tou", "vpp")
 
-# All valid inverter platform IDs.
-VALID_PLATFORMS = (
-    "growatt_server_min",
-    "growatt_server_sph",
-    "solax_modbus_growatt_min",
-    "solax_modbus_growatt_sph",
-    "solax_modbus_native",
-    "solis_modbus",
-    "huawei_solar_luna2000",
+# The HA integration domain each platform's *vendor* service calls target.
+# Only two platforms make any: huawei_solar.set_tou_periods and the
+# growatt_server TOU/AC-charge services. Every other service call BESS makes
+# infers its domain from the entity_id prefix (number vs input_number, switch
+# vs select) — these two target a device, so there is no prefix to read.
+# "" means the platform drives entities directly and calls no vendor service.
+# Overridable per install via inverter.service_domain, for integrations that
+# expose the same services under a different domain name (PR #412).
+PLATFORM_SERVICE_DOMAIN = {
+    "growatt_server_min": "growatt_server",
+    "growatt_server_sph": "growatt_server",
+    "solax_modbus_growatt_min": "",
+    "solax_modbus_growatt_sph": "",
+    "solax_modbus_native": "",
+    "solis_modbus": "",
+    "huawei_solar_luna2000": "huawei_solar",
+}
+
+# Sign convention for platforms exposing grid power as a single signed sensor
+# instead of separate import/export entities. Unlike PLATFORM_SERVICE_DOMAIN,
+# this is a fixed hardware/integration fact, not something an install can
+# override. "" (the default for any platform not listed) means the platform
+# has no signed-shared-sensor split to perform — every other consumer reads
+# import_power/export_power independently as always.
+#
+# "import_positive": positive raw value = importing from grid, negative = exporting.
+# "export_positive": positive raw value = exporting to grid, negative = importing.
+PLATFORM_GRID_POWER_POLARITY = {
+    "solis_modbus": "import_positive",  # Grid Power Net register 33263/33264
+    "huawei_solar_luna2000": "export_positive",  # power_meter_active_power (#438)
+}
+
+# Same idea, one layer down: platforms exposing BATTERY power as a single
+# signed register instead of separate charge/discharge entities (#542). Also a
+# fixed integration fact, not install-overridable. "" (the default) means the
+# platform publishes two real entities and needs no split.
+#
+# "charge_positive": positive raw value = charging, negative = discharging.
+#
+# Both listed platforms are charge_positive, verified against their register
+# definitions:
+#   solax_modbus           plugin_solax.py key="battery_power_charge",
+#                          REGISTER_S16, register 0x16 — no discharge key
+#                          exists anywhere in the integration.
+#   huawei_solar_luna2000  huawei-solar-lib registers.py:1193,
+#                          STORAGE_CHARGE_DISCHARGE_POWER: I32Register("W", 1,
+#                          37765). Reg 37765 itself documents no sign, but its
+#                          writable twin — reg 47321, "Battery charge and
+#                          discharge power", same INT32/W/gain 1 — states the
+#                          vendor convention in Huawei's SUN2000MA Modbus
+#                          Interface Definitions (Issue 08, 2024-11-07):
+#                          "> 0: charging; < 0: discharging". evcc's
+#                          huawei-sun2000-hybrid template independently
+#                          corroborates it, reading 37765 with scale: -1 to
+#                          reach its own positive=discharging convention.
+PLATFORM_BATTERY_POWER_POLARITY = {
+    "solax_modbus_native": "charge_positive",
+    "huawei_solar_luna2000": "charge_positive",
+}
+
+# The two sensor keys backed by each single signed entity, in
+# (mapped_key, derived_key) order: the integration publishes only the first,
+# and the second is pointed at the same entity so HAApiController's split can
+# derive it. See apply_signed_pair_aliases.
+_SIGNED_PAIRS = (
+    (PLATFORM_GRID_POWER_POLARITY, "import_power", "export_power"),
+    (
+        PLATFORM_BATTERY_POWER_POLARITY,
+        "battery_charge_power",
+        "battery_discharge_power",
+    ),
 )
 
-# Sensor keys that are shared across all platforms (not inverter-specific).
-SHARED_SENSOR_KEYS = frozenset(
-    {
-        "solar_forecast_today",
-        "solar_forecast_tomorrow",
-        "48h_avg_grid_import",
-        "current_l1",
-        "current_l2",
-        "current_l3",
-        "discharge_inhibit",
-        "weather_entity",
-    }
-)
+
+def apply_signed_pair_aliases(platform: str, sensors: dict) -> dict:
+    """Point a single signed entity's missing counterpart key at that entity.
+
+    Solis and Huawei publish grid power as one signed register, and native
+    SolaX and Huawei publish battery power the same way (#475, #542). The
+    split lives in HAApiController and is gated on BOTH keys resolving to the
+    same entity, so the counterpart has to be mapped for it to fire at all.
+
+    Which platforms are single-signed is a fixed integration fact — the
+    polarity maps above — so the pairing is derived here, on every read of a
+    per-platform sensor map, rather than only when discovery writes it. A
+    settings file persisted before the pairing existed otherwise leaves the
+    split silently off forever: charge power reads back negative while
+    discharging and discharge power reads back None, with no error anywhere
+    (#604). The legacy flat shape carries no platform, so it is not aliased —
+    ``_migrate_schema`` converts it to the per-platform shape for every
+    platform in ``VALID_PLATFORMS``, which is a superset of both polarity
+    maps.
+
+    An explicitly mapped counterpart is never overwritten — a user who mapped
+    a real second entity keeps two independent readings, which is exactly what
+    the split predicate's ``charge_entity == discharge_entity`` check honours.
+
+    Mutates and returns ``sensors``.
+    """
+    for polarity_map, mapped_key, derived_key in _SIGNED_PAIRS:
+        if not polarity_map.get(platform, ""):
+            continue
+        if sensors.get(mapped_key) and not sensors.get(derived_key):
+            sensors[derived_key] = sensors[mapped_key]
+    return sensors
+
+
+def flatten_sensors(sensors: dict) -> dict:
+    """Flatten a per-platform sensors dict into a flat sensor_key -> entity_id dict.
+
+    Handles both storage shapes:
+    - Legacy flat format (no "platform" key): returned as-is (string values only).
+    - Per-platform format: {"platform": <id>, "shared": {...}, "<platform>": {...}}
+      -> shared sensors merged with the active platform's sensors (platform wins
+      on key collision).
+
+    Shared module-level logic so both ``SettingsStore.get_active_sensors`` and
+    any caller validating a not-yet-persisted payload (e.g. the setup wizard's
+    ``sensors`` field, which is always in the per-platform shape) can flatten
+    consistently instead of assuming the flat shape.
+    """
+    if not isinstance(sensors, dict):
+        return {}
+
+    # Legacy flat format (no "platform" key) — return as-is
+    if "platform" not in sensors:
+        return {k: v for k, v in sensors.items() if isinstance(v, str)}
+
+    platform = sensors.get("platform", "")
+    platform_sensors = sensors.get(platform, {})
+    shared_sensors = sensors.get("shared", {})
+
+    result = {}
+    if isinstance(shared_sensors, dict):
+        result.update(shared_sensors)
+    if isinstance(platform_sensors, dict):
+        result.update(platform_sensors)
+    return apply_signed_pair_aliases(platform, result)
 
 
 class SettingsStore:
@@ -172,6 +287,41 @@ class SettingsStore:
         self._write(self.data)
         logger.info("Saved all settings to %s", SETTINGS_PATH)
 
+    def get_service_domain(self) -> str:
+        """Return the HA integration domain for this install's vendor service calls.
+
+        ``inverter.service_domain`` is an override: when empty (the normal
+        case, and the state of every install predating the field) the
+        configured platform's standard domain from PLATFORM_SERVICE_DOMAIN
+        applies. Returns "" for platforms that make no vendor service calls
+        and for an unconfigured install.
+        """
+        inverter = self.data.get("inverter", {})
+        override = str(inverter.get("service_domain", "") or "").strip()
+        if override:
+            return override
+        return PLATFORM_SERVICE_DOMAIN.get(inverter.get("platform", ""), "")
+
+    def get_grid_power_polarity(self) -> str:
+        """Return the sign convention for this platform's grid power sensor.
+
+        "" for platforms with separate import/export entities (no split
+        needed) and for an unconfigured install. Not user-overridable —
+        see PLATFORM_GRID_POWER_POLARITY.
+        """
+        inverter = self.data.get("inverter", {})
+        return PLATFORM_GRID_POWER_POLARITY.get(inverter.get("platform", ""), "")
+
+    def get_battery_power_polarity(self) -> str:
+        """Return the sign convention for this platform's battery power sensor.
+
+        "" for platforms with separate charge/discharge entities (no split
+        needed) and for an unconfigured install. Not user-overridable —
+        see PLATFORM_BATTERY_POWER_POLARITY.
+        """
+        inverter = self.data.get("inverter", {})
+        return PLATFORM_BATTERY_POWER_POLARITY.get(inverter.get("platform", ""), "")
+
     def get_active_sensors(self) -> dict:
         """Return a flat sensor dict merging the active platform's sensors with shared sensors.
 
@@ -179,24 +329,7 @@ class SettingsStore:
         dict of sensor_key → entity_id without needing to know about the
         per-platform storage structure.
         """
-        sensors = self.data.get("sensors", {})
-        if not isinstance(sensors, dict):
-            return {}
-
-        # Legacy flat format (no "platform" key) — return as-is
-        if "platform" not in sensors:
-            return {k: v for k, v in sensors.items() if isinstance(v, str)}
-
-        platform = sensors.get("platform", "")
-        platform_sensors = sensors.get(platform, {})
-        shared_sensors = sensors.get("shared", {})
-
-        result = {}
-        if isinstance(shared_sensors, dict):
-            result.update(shared_sensors)
-        if isinstance(platform_sensors, dict):
-            result.update(platform_sensors)
-        return result
+        return flatten_sensors(self.data.get("sensors", {}))
 
     def apply_discovered(
         self,
@@ -377,7 +510,6 @@ class SettingsStore:
             BATTERY_CHARGE_CYCLE_COST,
             BATTERY_MAX_CHARGE_DISCHARGE_POWER_KW,
             BATTERY_MAX_SOC,
-            BATTERY_MIN_ACTION_PROFIT_THRESHOLD,
             BATTERY_MIN_SOC,
             BATTERY_STORAGE_SIZE_KWH,
             DEFAULT_AREA,
@@ -403,13 +535,12 @@ class SettingsStore:
                 "max_charge_power_kw": BATTERY_MAX_CHARGE_DISCHARGE_POWER_KW,
                 "max_discharge_power_kw": BATTERY_MAX_CHARGE_DISCHARGE_POWER_KW,
                 "cycle_cost_per_kwh": BATTERY_CHARGE_CYCLE_COST,
-                "min_action_profit_threshold": BATTERY_MIN_ACTION_PROFIT_THRESHOLD,
                 "external_solar_mode": False,
             },
             "home": {
                 "default_hourly": HOME_HOURLY_CONSUMPTION_KWH,
                 "currency": DEFAULT_CURRENCY,
-                "consumption_strategy": "sensor",
+                "consumption_strategy": "fixed",
                 "max_fuse_current": HOUSE_MAX_FUSE_CURRENT_A,
                 "voltage": HOUSE_VOLTAGE_V,
                 "safety_margin": SAFETY_MARGIN_FACTOR,
@@ -434,8 +565,13 @@ class SettingsStore:
                 "octopus": {},
                 "entsoe": {"entity": ""},
             },
-            "growatt": {"inverter_type": "", "device_id": ""},
-            "inverter": {"platform": "", "device_id": "", "control_mode": "tou"},
+            "growatt": {"device_id": ""},
+            "inverter": {
+                "platform": "",
+                "device_id": "",
+                "control_mode": "tou",
+                "service_domain": "",
+            },
             "sensors": {
                 "platform": "",
                 "growatt_server_min": {},
@@ -460,7 +596,6 @@ class SettingsStore:
             BATTERY_DEFAULT_CHARGING_POWER_RATE,
             BATTERY_EFFICIENCY_CHARGE,
             BATTERY_EFFICIENCY_DISCHARGE,
-            BATTERY_MIN_ACTION_PROFIT_THRESHOLD,
             EXPORT_SPOT_MULTIPLIER,
             INVERTER_AC_POWER_MARGIN,
             INVERTER_MAX_AC_POWER_KW,
@@ -496,10 +631,25 @@ class SettingsStore:
                 )
                 changed = True
 
+            # Drop: min_action_profit_threshold.  The DP's profit-threshold
+            # gate was removed in the Bellman-optimality guardrail refactor,
+            # and the field is gone from BatterySettings.
+            #
+            # Not load-bearing for startup: build_system_settings() filters the
+            # battery section to BATTERY_MODEL_ATTRS (derived from the
+            # dataclass), so a leftover key is dropped there and never reaches
+            # BatterySettings.update().  This strip is hygiene — bess_settings.json
+            # is user-visible and hand-editable, and a key that silently does
+            # nothing invites someone to tune it.
+            if battery.pop("min_action_profit_threshold", None) is not None:
+                logger.info(
+                    "Schema migration: removed obsolete battery.min_action_profit_threshold"
+                )
+                changed = True
+
             # Add missing fields with defaults
             for key, default in (
                 ("cycle_cost_per_kwh", BATTERY_CHARGE_CYCLE_COST),
-                ("min_action_profit_threshold", BATTERY_MIN_ACTION_PROFIT_THRESHOLD),
                 ("charging_power_rate", BATTERY_DEFAULT_CHARGING_POWER_RATE),
                 ("efficiency_charge", BATTERY_EFFICIENCY_CHARGE),
                 ("efficiency_discharge", BATTERY_EFFICIENCY_DISCHARGE),
@@ -584,16 +734,16 @@ class SettingsStore:
 
         growatt = self.data.get("growatt")
         if isinstance(growatt, dict):
-            from api_conversion import UI_TYPE_TO_PLATFORM
+            from api_conversion import LEGACY_INVERTER_PLATFORM_MAP
 
             old_type = growatt.get("inverter_type", "")
             inverter = dict(self.data.get("inverter", {}))
             if (
                 old_type
                 and not inverter.get("platform")
-                and old_type in UI_TYPE_TO_PLATFORM
+                and old_type in LEGACY_INVERTER_PLATFORM_MAP
             ):
-                platform = UI_TYPE_TO_PLATFORM[old_type]
+                platform = LEGACY_INVERTER_PLATFORM_MAP[old_type]
                 inverter["platform"] = platform
                 if not inverter.get("device_id") and growatt.get("device_id"):
                     inverter["device_id"] = growatt["device_id"]
@@ -649,6 +799,33 @@ class SettingsStore:
                     len(shared),
                 )
                 changed = True
+
+        # --- Huawei discharge-stop SOC repoint (existing installs) ---
+        # battery_discharge_stop_soc used to be mapped to the grid-charge
+        # cutoff register (storage_grid_charge_cutoff_state_of_charge) — a
+        # reserve floor for grid charging, not the discharge floor BESS needs.
+        # It now maps to storage_discharging_cutoff_capacity. Discovery only
+        # re-runs from the wizard, never on startup, so an install persisted
+        # with the old entity would keep writing the wrong register forever.
+        # Clearing the stale mapping makes the health check report it missing,
+        # which prompts a wizard re-scan that repoints it correctly. A mapping
+        # already on the discharging-cutoff entity (or one a user renamed away
+        # from the grid-charge-cutoff pattern) is left untouched.
+        sensors = self.data.get("sensors")
+        if isinstance(sensors, dict):
+            huawei_sensors = sensors.get("huawei_solar_luna2000")
+            if isinstance(huawei_sensors, dict):
+                stale = huawei_sensors.get("battery_discharge_stop_soc", "")
+                if isinstance(stale, str) and "grid_charge_cutoff" in stale:
+                    del huawei_sensors["battery_discharge_stop_soc"]
+                    logger.info(
+                        "Schema migration: cleared stale Huawei "
+                        "battery_discharge_stop_soc mapping %s (grid-charge "
+                        "cutoff register); re-run discovery to repoint it to the "
+                        "discharging cutoff capacity entity.",
+                        stale,
+                    )
+                    changed = True
 
         # --- demo_mode section (added v9.5) ---
         if "demo_mode" not in self.data:

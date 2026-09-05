@@ -37,11 +37,11 @@
   },
   "expected_results": {
     "base_cost": 2.36,
-    "battery_solar_cost": 0.394,
-    "base_to_battery_solar_savings": 1.966,
-    "base_to_battery_solar_savings_pct": 83.305085,
+    "battery_solar_cost": 0.376,
+    "base_to_battery_solar_savings": 1.984,
+    "base_to_battery_solar_savings_pct": 84.0678,
     "total_charged": 0.0,
-    "total_discharged": 2.52
+    "total_discharged": 2.535
   },
   "expected_behavior": {
     "description": "Short horizon evening peak with solar: charge and export during peak",
@@ -53,5 +53,9 @@
       "soe_within_bounds": true,
       "power_within_limits": true
     }
-  }
+  },
+  "_zero_spread_reason": "Zero-spread (buy==sell) price_data is intentional, not an oversight: applying the app's realistic markup/VAT/tax spread eliminates the fixture's sole pinned intent (BATTERY_EXPORT) entirely -- see docs/superpowers/specs/2026-08-03-milp-optimizer-pivot-450.md follow-up.",
+  "terminal_value_per_kwh": 0.1475,
+  "terminal_knee_kwh": null,
+  "terminal_tail_rate": 0.0
 }

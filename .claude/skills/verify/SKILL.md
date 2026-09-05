@@ -11,6 +11,9 @@ HTTP API (or load the served frontend) to observe the change.
 
 ## One-time setup
 
+- In a fresh worktree, run `./scripts/worktree-setup.sh` first — it shares
+  `.venv` and both `node_modules` trees with the main checkout and repairs a
+  broken Playwright browser cache, instead of reinstalling all of it (~35 min).
 - `podman-compose` isn't always on PATH: `pip install --user podman-compose`,
   then add `~/Library/Python/<ver>/bin` to PATH for the shell session.
   `podman compose` (the built-in plugin) does NOT work here — it looks for a
@@ -26,8 +29,16 @@ with another worktree's running stack:
 
 ```bash
 SCENARIO=ci-normal-day BESS_PORT=18180 MOCK_HA_PORT=18123 \
-  podman-compose -p <unique-name> -f docker-compose.ci.yml up -d --build
+  podman-compose -p <unique-name> -f docker-compose.ci.yml up -d
 ```
+
+Add `--build` only when you changed something baked into the image
+(`backend/Dockerfile.dev`, `requirements*.txt`, or anything under
+`scripts/mock_ha/` other than `scenarios/`) — the compose file bind-mounts the
+backend source, so an unnecessary rebuild costs minutes and changes nothing.
+Note that mock-HA is the opposite case: its Dockerfile does `COPY . .` and only
+`scenarios/` is bind-mounted, so an edit to `server.py` without `--build` runs
+the stale baked copy and silently invalidates the whole observation.
 
 Wait for both containers healthy (`podman ps --filter name=<unique-name>`),
 then hit the real API:
@@ -60,10 +71,16 @@ port to find real entity IDs/attributes to restore.
 ## Gotchas
 
 - `${BESS_SETTINGS:-./e2e/ci-bess-settings.json}` is mounted **read-write**
-  (no `:ro`). Running the app against it can silently write settings back
-  into the fixture (schema migrations, demo_mode defaults, etc). After
-  tearing down: `git diff -- e2e/` and `git checkout -- e2e/` if the only
-  changes are ones you didn't intend.
+  (no `:ro`), and it has to be — that mount *is* how the app persists
+  settings, so `:ro` would break the wizard rather than protect the file.
+  Running the app against it therefore writes settings back into the fixture
+  (schema migrations, demo_mode defaults, etc). After tearing down:
+  `git diff -- e2e/` and `git checkout -- e2e/` if the only changes are ones
+  you didn't intend.
+  `e2e/ci-wizard-settings.json` is the exception and needs no such reset: it
+  is gitignored, because every consumer truncates it to `{}` before mounting
+  it and nothing reads its content. The `ci-bess-settings*.json` files are
+  real fixtures whose content matters, so those still dirty the tree.
 - Many scenarios (e.g. `ci-wizard-entsoe.json`) pin `mock_time` to a fixed
   past date (`ci-normal-day.json` → `2025-01-15`), not "today" — the real
   container clock is today's date, so date-anchored service calls (Nordpool

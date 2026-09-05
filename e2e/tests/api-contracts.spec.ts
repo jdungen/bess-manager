@@ -222,7 +222,25 @@ test.describe('API Contracts: /api/growatt/inverter_status', () => {
     expect(typeof body.batterySoe).toBe('number');
     expect(typeof body.batteryChargePower).toBe('number');
     expect(typeof body.batteryDischargePower).toBe('number');
-    expect(typeof body.batteryMode).toBe('string');
+    // batteryMode is a real TOU register label only for tou_register
+    // platforms -- vpp_power/period_list controllers have no such register,
+    // so the backend must not fabricate one (#415).
+    //
+    // For non-tou_register platforms it must always be absent. For
+    // tou_register it is normally present, but /api/growatt/inverter_status
+    // derives it from the DP schedule's strategic intents
+    // (get_period_settings() in core/bess/inverter_controller.py), which
+    // raises until the background startup optimization cycle has produced a
+    // schedule (mirrors the same startup race /api/dashboard guards against
+    // with its "initializing" response). The backend correctly omits the
+    // field rather than fabricating a value in that window, so the field
+    // may legitimately be absent here too if this request lands before the
+    // first schedule is ready.
+    if (body.controlModel === 'tou_register') {
+      expect(['string', 'undefined']).toContain(typeof body.batteryMode);
+    } else {
+      expect(body.batteryMode).toBeUndefined();
+    }
     expect(typeof body.gridChargeEnabled).toBe('boolean');
     expect(typeof body.chargeStopSoc).toBe('number');
     expect(typeof body.dischargeStopSoc).toBe('number');
@@ -251,7 +269,13 @@ test.describe('API Contracts: /api/growatt/detailed_schedule', () => {
     // Each hour entry (camelCase keys)
     const hour = body.scheduleData[0];
     expect(typeof hour.hour).toBe('number');
-    expect(typeof hour.batteryMode).toBe('string');
+    // batteryMode is only a real value for tou_register platforms -- see
+    // the /api/growatt/inverter_status batteryMode assertion above (#415).
+    if (body.controlModel === 'tou_register') {
+      expect(typeof hour.batteryMode).toBe('string');
+    } else {
+      expect(hour.batteryMode).toBeUndefined();
+    }
     expect(typeof hour.strategicIntent).toBe('string');
     expect(typeof hour.action).toBe('string');
     expect(hour).toHaveProperty('price');
@@ -282,34 +306,6 @@ test.describe('API Contracts: /api/system-health', () => {
     expect(Array.isArray(body.checks)).toBe(true);
     expect(typeof body.timestamp).toBe('string');
     expect(typeof body.systemMode).toBe('string');
-  });
-});
-
-test.describe('API Contracts: /api/decision-intelligence', () => {
-  test('returns patterns or fallback with summary', async ({ request }) => {
-    const res = await request.get('/api/decision-intelligence');
-    expect(res.status()).toBe(200);
-    const body = await res.json();
-
-    expect(body).toHaveProperty('summary');
-
-    // When real data is available: patterns array with hour entries
-    if (body.patterns) {
-      expect(Array.isArray(body.patterns)).toBe(true);
-      if (body.patterns.length > 0) {
-        const p = body.patterns[0];
-        expect(typeof p.hour).toBe('number');
-        expect(p).toHaveProperty('flows');
-        expect(p).toHaveProperty('netStrategyValue');
-      }
-      // Summary has totals
-      expect(body.summary).toHaveProperty('totalNetValue');
-      expect(body.summary).toHaveProperty('bestDecisionHour');
-    } else {
-      // Fallback: empty hours array with basic summary
-      expect(body).toHaveProperty('hours');
-      expect(Array.isArray(body.hours)).toBe(true);
-    }
   });
 });
 

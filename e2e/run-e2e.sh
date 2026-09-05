@@ -83,12 +83,12 @@ if [ "$RUN_WIZARD" = true ]; then
     "ci-wizard-entsoe-frank-126"
     "ci-wizard-full"
     "ci-wizard-nordpool-hacs"
-    "ci-wizard-octopus-sph"
+    "ci-wizard-growatt-sph-cloud-octopus"
     "ci-wizard-both-providers"
     "ci-wizard-growatt-modbus"
-    "ci-wizard-growatt-modbus-gen3"
     "ci-wizard-solis"
     "ci-wizard-growatt-vpp"
+    "ci-wizard-growatt-vpp-ridax-118"
   )
 
   for scenario in "${WIZARD_SCENARIOS[@]}"; do

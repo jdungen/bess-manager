@@ -8,10 +8,27 @@ the BESS system, providing type safety and clear interfaces between components.
 """
 
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 
 logger = logging.getLogger(__name__)
+
+# Energy resolution floor for grid flows (kWh). Home Assistant's lifetime
+# energy counters report at 0.1 kWh resolution, so a measured grid flow below
+# this cannot be told apart from counter noise between two independent sensors.
+#
+# Single source of truth on purpose (#497). This value answers exactly one
+# question -- "is this export real, or is it below the resolution at which we
+# can know anything?" -- and it used to be answered in two places that drifted
+# apart: this module's noise fold hardcoded 0.1 while the DP's self-throttle
+# threshold used 0.01, leaving a band where the optimizer booked export revenue
+# for energy the flow calculator had already decided never left the property.
+# Same failure shape as the #275 postmortem (see dp_constants.py): one physical
+# boundary, two independent constants, no enforcement that they agree.
+#
+# Homed here, in the measurement/model layer, because it describes the sensors,
+# not the optimizer -- the DP's `_discharge_is_unexecutable` imports it.
+GRID_FLOW_RESOLUTION_KWH = 0.1
 
 __all__ = [
     "DecisionData",
@@ -19,6 +36,7 @@ __all__ = [
     "EnergyData",
     "OptimizationResult",
     "PeriodData",
+    "apply_export_curtailment_to_period_data",
     "infer_intent_from_flows",
 ]
 
@@ -29,7 +47,7 @@ def infer_intent_from_flows(power: float, energy_data: "EnergyData") -> str:
 
     NOTE: For OBSERVATIONAL purposes only (dashboard display of what happened).
     The authoritative intent comes from DP algorithm economics-based decision
-    in decision_intelligence.create_decision_data().
+    in strategic_intent.create_decision_data().
 
     This function looks at actual energy flows to determine what the battery
     appeared to be doing. It cannot determine economic intent (e.g., whether
@@ -74,9 +92,13 @@ class EnergyData:
     battery_soe_start: float  # kWh (changed from battery_soc_start)
     battery_soe_end: float  # kWh (changed from battery_soc_end)
 
-    # Solar lost to the inverter AC output cap (kWh) — DC production the
-    # inverter could neither convert to AC nor store in a full/rate-limited
-    # battery. Zero unless the inverter_max_ac_power_kw feature is enabled.
+    # Solar production never delivered as AC-side export/consumption (kWh).
+    # Two causes: the inverter AC output cap (DC production the inverter
+    # could neither convert to AC nor store in a full/rate-limited battery,
+    # zero unless inverter_max_ac_power_kw is enabled), or the solar-sourced
+    # share of a period's export curtailed to zero at runtime by PV
+    # export-limit curtailment (#502, zero unless export_curtailment_enabled
+    # -- see apply_export_curtailment_to_period_data).
     clipped_solar: float = 0.0
 
     # Detailed flows (calculated automatically in __post_init__)
@@ -151,12 +173,16 @@ class EnergyData:
             self.battery_discharged - battery_to_home,
         )
 
-        # A battery_to_grid below the lifetime counter's own 0.1 kWh resolution
-        # can't be told apart from counter noise between battery_discharged and
-        # home_consumption - and unlike a real export, it doesn't require the
-        # inverter to have been in an export-capable mode. Fold it back into
-        # battery_to_home rather than let it flip the observed intent to
-        # BATTERY_EXPORT (see issue #350).
+        # A battery_to_grid below the lifetime counter's own resolution
+        # (GRID_FLOW_RESOLUTION_KWH) can't be told apart from counter noise
+        # between battery_discharged and home_consumption - and unlike a real
+        # export, it doesn't require the inverter to have been in an
+        # export-capable mode. Fold it back into battery_to_home rather than
+        # let it flip the observed intent to BATTERY_EXPORT (see issue #350).
+        #
+        # The DP's self-throttle threshold is derived from this same constant
+        # (#497), so a planned discharge can no longer land in a band where the
+        # optimizer credits an export that this fold then erases.
         #
         # Only when battery_to_home > 0: the battery was already covering a
         # genuine home deficit, so a sub-resolution overshoot plausibly means
@@ -164,7 +190,7 @@ class EnergyData:
         # battery_to_home == 0 (home's need was already fully met by solar),
         # there's no deficit to fold into - any nonzero export, however small,
         # has nowhere else to have gone and must stay a real export.
-        if battery_to_home > 0 and 0 < battery_to_grid < 0.1:
+        if battery_to_home > 0 and 0 < battery_to_grid < GRID_FLOW_RESOLUTION_KWH:
             battery_to_home += battery_to_grid
             battery_to_grid = 0.0
 
@@ -342,28 +368,37 @@ class DecisionData:
     )
     cost_basis: float = 0.0  # per kWh - cost basis of stored energy
     shadow_price: float = (
-        0.0  # SEK per kWh of SoE - marginal opportunity value of stored energy
-        # (DP value-function gradient dV/dSoE). Used to gate SOLAR_EXPORT discharge.
+        0.0  # SEK per kWh DELIVERED - marginal opportunity value of stored
+        # energy, priced per kWh out of the battery rather than per kWh of SoE
+        # (#683; the two differ by the discharge efficiency, delivered =
+        # dV/dSoE / eta). REPORTING ONLY (#526): it is a
+        # reading of the interpolant the policy walks (#571,
+        # `_value_of_delivering_below`), so it does not exist at or below the
+        # reserve floor, where there is no cell underneath to price,
+        # and 0.0 is indistinguishable between "computed as worthless" and
+        # "never computed". No consumer may re-derive a decision from it --
+        # read intra_period_discharge_allowed instead.
     )
-
-    # Enhanced intelligence fields (optional)
-    pattern_name: str = ""  # Name of detected pattern
-    description: str = ""  # Human-readable description
-    economic_chain: str = ""  # Economic reasoning chain
-    immediate_value: float = 0.0  # Immediate economic value
-    future_value: float = 0.0  # Future economic value
-    net_strategy_value: float = 0.0  # Net strategic value
-
-    # Simple enhanced fields that we can actually implement
-    advanced_flow_pattern: str = (
-        ""  # Detailed flow pattern (e.g., SOLAR_TO_HOME_AND_BATTERY)
+    intra_period_discharge_allowed: bool = (
+        False  # DP's decision (#526): may the sub-period discharge ceiling be
+        # opened for this period? Decided where the value function is owned,
+        # using dV/dSoE when it exists. False where no shadow price is
+        # computable: at the bottom grid level there is no removable kWh below
+        # this state, so there is nothing to authorize. Absence is never
+        # permission -- a decision this DP did not make stays False.
     )
-    detailed_flow_values: dict[str, float] = field(
-        default_factory=dict
-    )  # Value per flow in configured currency
-    future_target_hours: list[int] = field(
-        default_factory=list
-    )  # When future opportunity occurs
+    future_value: float = (
+        0.0  # DP value-to-go (continuation_value) from the resulting battery
+        # level onward -- the best achievable outcome from here forward.
+    )
+    curtailed: bool = (
+        False  # Planned PV curtailment (#501): grid_exported > 0 and
+        # sell_price below export_curtailment_price_floor while curtailment
+        # is active. Mirrors BSM's execution-time gate
+        # (_apply_period_schedule's should_curtail) so the plan can report
+        # what actuation will do, distinct from a genuinely profitable
+        # SOLAR_EXPORT.
+    )
 
     @classmethod
     def from_observed_flows(cls, energy_data: EnergyData) -> "DecisionData":
@@ -466,6 +501,65 @@ class PeriodData:
         return errors
 
 
+def apply_export_curtailment_to_period_data(
+    period_data: PeriodData,
+    export_curtailment_active: bool,
+    export_curtailment_price_floor: float,
+) -> PeriodData:
+    """Return a reporting-only view of period_data with export curtailment
+    applied, for a period that will actually be curtailed to zero export at
+    runtime (#502): exporting at a sell price below the floor, with
+    export_curtailment_active True (the caller-computed, capability-aware
+    flag -- never the raw settings field, so reporting can't disagree with
+    what BSM's execution-time trigger will actually do on this platform).
+
+    The curtailed energy is reported as unharvested production (folded into
+    clipped_solar, mechanically identical to existing AC-cap clipping), not
+    as harvested and discarded -- because the hardware mechanism this models
+    only throttles PV/MPPT production (ha_api_controller.
+    set_growatt_export_limit's own comment), never battery discharge. Only
+    the solar-sourced share of grid_exported (energy.solar_to_grid) is
+    curtailed here; any battery-sourced export (energy.battery_to_grid)
+    still happens and is still reported at its real cost.
+
+    Returns period_data unchanged if curtailment doesn't apply, or if the
+    period's export was entirely battery-sourced (nothing PV-side to
+    curtail). Never mutates the input -- callers must apply this only at
+    reporting seams, never to the PeriodData BSM stores in schedule_store,
+    which the execution-time curtailment trigger and the DP's guardrail
+    comparison both require to stay at the honest, real price.
+    """
+    energy = period_data.energy
+    economic = period_data.economic
+    curtailed_solar_export = energy.solar_to_grid
+    if (
+        not export_curtailment_active
+        or energy.grid_exported <= 0
+        or economic.sell_price >= export_curtailment_price_floor
+        or curtailed_solar_export <= 0
+    ):
+        return period_data
+
+    adjusted_energy = EnergyData(
+        solar_production=energy.solar_production,
+        home_consumption=energy.home_consumption,
+        battery_charged=energy.battery_charged,
+        battery_discharged=energy.battery_discharged,
+        grid_imported=energy.grid_imported,
+        grid_exported=energy.grid_exported - curtailed_solar_export,
+        battery_soe_start=energy.battery_soe_start,
+        battery_soe_end=energy.battery_soe_end,
+        clipped_solar=energy.clipped_solar + curtailed_solar_export,
+    )
+    adjusted_economic = EconomicData.from_energy_data(
+        adjusted_energy,
+        economic.buy_price,
+        economic.sell_price,
+        economic.battery_cycle_cost,
+    )
+    return replace(period_data, energy=adjusted_energy, economic=adjusted_economic)
+
+
 @dataclass
 class OptimizationResult:
     """Result structure returned by optimize_battery_schedule."""
@@ -473,3 +567,16 @@ class OptimizationResult:
     input_data: dict
     period_data: list[PeriodData]
     economic_summary: EconomicSummary | None = None
+    # The DP's *own* objective value for this schedule: the negated sum of
+    # each period's `_compute_reward` return, accumulated as the actions were
+    # chosen (or recomputed by `_replay_accounting_pass` when the hybrid PWL
+    # path re-solves a window). This is the quantity the optimizer actually
+    # minimises, and the only one safe to compare across algorithms or pin in
+    # a regression test -- `economic_summary.battery_solar_cost` is rebuilt
+    # from reported PeriodData and can drift from it (see TODO.md's
+    # `_build_period_data` reporting-drift entry).
+    #
+    # `None` means "not produced by an optimizer run": the all-IDLE safety-net
+    # schedule and results constructed directly in tests carry no reward
+    # accumulation. It is never a degraded stand-in for a real value.
+    reward_objective_cost: float | None = None

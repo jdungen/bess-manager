@@ -119,27 +119,66 @@ class HomePowerMonitor:
             all_methods=all_methods,
         )
 
+        # perform_health_check() treats an unmapped sensor as SKIPPED and
+        # excludes it from the pass/fail tally, because is_required=False
+        # above reflects that power monitoring as a whole is optional.
+        # But once power_monitoring_enabled is True (checked above), these
+        # specific sensors ARE required for the feature to function —
+        # otherwise adjust_charging_power() crashes every cycle on a None
+        # sensor read (see get_current_phase_loads_w). Promote SKIPPED to
+        # ERROR here rather than in the shared perform_health_check(), which
+        # other required-but-optional-looking call sites still rely on.
+        had_missing_sensor = False
+        for check in health_check["checks"]:
+            if check["status"] == "SKIPPED":
+                had_missing_sensor = True
+                check["status"] = "ERROR"
+                check["error"] = (
+                    "Power monitoring is enabled but this sensor is not "
+                    "configured — map it in Settings → Sensors, or disable "
+                    "fuse protection in Settings → Home."
+                )
+                check["displayValue"] = "Not configured"
+        if had_missing_sensor:
+            health_check["status"] = "ERROR"
+
         return [health_check]
 
     def get_current_phase_loads_w(self) -> tuple[float, ...]:
         """Get current load on each phase in watts.
 
         Returns a tuple with one element per phase (1 for single-phase, 3 for three-phase).
+
+        Raises:
+            ValueError: If a phase current sensor read returns None (sensor
+                unavailable or unmapped) — caught by adjust_charging_power()'s
+                except clause rather than crashing on `None * voltage`.
         """
         voltage = self.home_settings.voltage
 
         if self.home_settings.phase_count == 1:
             l1_current = self.controller.get_l1_current()
+            if l1_current is None:
+                raise ValueError(
+                    "Cannot calculate phase load: current_l1 sensor read returned None"
+                )
             return (l1_current * voltage,)
 
-        l1_current = self.controller.get_l1_current()
-        l2_current = self.controller.get_l2_current()
-        l3_current = self.controller.get_l3_current()
+        readings = {
+            "current_l1": self.controller.get_l1_current(),
+            "current_l2": self.controller.get_l2_current(),
+            "current_l3": self.controller.get_l3_current(),
+        }
+        missing = [key for key, value in readings.items() if value is None]
+        if missing:
+            raise ValueError(
+                f"Cannot calculate phase load: sensor read returned None for {', '.join(missing)}"
+            )
 
         return (
-            l1_current * voltage,
-            l2_current * voltage,
-            l3_current * voltage,
+            readings["current_l1"] * voltage,
+            readings["current_l2"] * voltage,
+            readings["current_l3"] * voltage,
         )
 
     def calculate_available_charging_power(self) -> float:
@@ -208,6 +247,16 @@ class HomePowerMonitor:
             target_power = self.calculate_available_charging_power()
 
         current_power = self.controller.get_charging_power_rate()
+        if current_power is None:
+            # The sensor read degraded (transient HA failure -- _get_raw_state
+            # returns None once _api_request's retries are exhausted). Without
+            # the current rate there is nothing to compare against, so leave
+            # the inverter on its existing rate rather than writing blind.
+            logger.warning(
+                "Charging power rate unreadable; leaving the inverter rate "
+                "unchanged for this adjustment"
+            )
+            return
 
         # Skip if no change needed (within 1% tolerance)
         if abs(target_power - current_power) < 1:

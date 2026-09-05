@@ -11,6 +11,10 @@ from core.bess.dp_battery_algorithm import optimize_battery_schedule
 from core.bess.exceptions import PriceDataUnavailableError
 from core.bess.price_manager import MockSource
 from core.bess.settings import BatterySettings
+from core.bess.terminal_value import (
+    TerminalValueCurve,
+    calculate_terminal_value_per_kwh,
+)
 from core.bess.tests.conftest import MockHomeAssistantController, MockSensorCollector
 from core.bess.time_utils import get_period_count
 
@@ -47,6 +51,10 @@ def _make_system(
         price_source=price_source,
         addon_options={"inverter": {"platform": "growatt_server_min"}},
     )
+    # Since #709 the optimizer reads prices cache-only; the running system
+    # warms the cache once in start(). Mirror that so _get_price_data() has
+    # data to return (a cold cache aborts the cycle at "No price data").
+    system._price_manager.refresh_cache()
     return system
 
 
@@ -300,8 +308,8 @@ class TestCalculateTerminalValue:
         # today-only case, not return 0.0. Sell prices vary so the cap branch
         # applies (it is skipped on a fixed export tariff, #359).
         sell_prices = [0.6, 0.8] * 96
-        terminal_value = system._calculate_terminal_value(
-            buy_prices=[1.0] * 192, sell_prices=sell_prices, optimization_period=0
+        terminal_value = calculate_terminal_value_per_kwh(
+            [1.0] * 192, sell_prices, system.battery_settings
         )
 
         median_price = 1.0
@@ -328,8 +336,8 @@ class TestCalculateTerminalValue:
 
         # Only 50 remaining prices (clearly today-only), sell prices high enough
         # that the arbitrage cap doesn't bind.
-        terminal_value = system._calculate_terminal_value(
-            buy_prices=[1.0] * 50, sell_prices=[1.0] * 50, optimization_period=46
+        terminal_value = calculate_terminal_value_per_kwh(
+            [1.0] * 50, [1.0] * 50, system.battery_settings
         )
 
         # Should be median_buy * efficiency_discharge - cycle_cost > 0
@@ -342,8 +350,8 @@ class TestCalculateTerminalValue:
         # Very low prices + high cycle cost should floor at 0.0
         system.battery_settings.cycle_cost_per_kwh = 5.0
 
-        terminal_value = system._calculate_terminal_value(
-            buy_prices=[0.01] * 10, sell_prices=[0.01] * 10, optimization_period=86
+        terminal_value = calculate_terminal_value_per_kwh(
+            [0.01] * 10, [0.01] * 10, system.battery_settings
         )
 
         assert terminal_value == 0.0
@@ -359,8 +367,8 @@ class TestCalculateTerminalValue:
         buy_prices = [0.21, 0.24, 0.30, 0.35, 0.38]  # median = 0.30
         sell_prices = [0.10, 0.12, 0.13, 0.15, 0.16]  # max = 0.16
 
-        terminal_value = system._calculate_terminal_value(
-            buy_prices=buy_prices, sell_prices=sell_prices, optimization_period=91
+        terminal_value = calculate_terminal_value_per_kwh(
+            buy_prices, sell_prices, system.battery_settings
         )
 
         eff = system.battery_settings.efficiency_discharge
@@ -380,8 +388,8 @@ class TestCalculateTerminalValue:
         buy_prices = [0.6, 0.6, 0.6, 1.4, 1.4]  # median = 0.6
         sell_prices = [p * 0.85 for p in buy_prices]  # max = 1.19
 
-        terminal_value = system._calculate_terminal_value(
-            buy_prices=buy_prices, sell_prices=sell_prices, optimization_period=91
+        terminal_value = calculate_terminal_value_per_kwh(
+            buy_prices, sell_prices, system.battery_settings
         )
 
         eff = system.battery_settings.efficiency_discharge
@@ -404,8 +412,8 @@ class TestCalculateTerminalValue:
         buy_prices = [0.20, 0.22, 0.24, 0.34, 0.40]  # median = 0.24
         sell_prices = [0.12] * 5  # fixed export tariff (e.g. Octopus Outgoing)
 
-        terminal_value = system._calculate_terminal_value(
-            buy_prices=buy_prices, sell_prices=sell_prices, optimization_period=29
+        terminal_value = calculate_terminal_value_per_kwh(
+            buy_prices, sell_prices, system.battery_settings
         )
 
         eff_discharge = system.battery_settings.efficiency_discharge
@@ -456,8 +464,8 @@ class TestCalculateTerminalValue:
         # The production formula's actual value for this price window --
         # not a hand-copied constant, so this stays coupled to
         # `_calculate_terminal_value` itself.
-        terminal_value = system._calculate_terminal_value(
-            buy_prices=prices, sell_prices=prices, optimization_period=0
+        terminal_value = calculate_terminal_value_per_kwh(
+            prices, prices, system.battery_settings
         )
         assert terminal_value > 0.0
 
@@ -470,7 +478,7 @@ class TestCalculateTerminalValue:
                 initial_soe=10.0,
                 battery_settings=system.battery_settings,
                 period_duration_hours=1.0,
-                terminal_value_per_kwh=terminal_value_per_kwh,
+                terminal_curve=TerminalValueCurve.flat(terminal_value_per_kwh),
             )
             return result.period_data[-1].energy.battery_soe_end
 
@@ -552,6 +560,9 @@ class TestTerminalValueCapExcludesCommittedPeriods:
         controller.consumption_forecast = [0.0] * n  # isolate export decisions
         system = _make_system(source, controller)
         system.battery_settings.cycle_cost_per_kwh = 0.035
+        # The "fixed" default ignores the mocked zero consumption_forecast;
+        # force "sensor" so the isolation above actually takes effect.
+        system.home_settings.consumption_strategy = "sensor"
 
         optimization_period = 75  # ~18:45 today, before the near-term peak
 

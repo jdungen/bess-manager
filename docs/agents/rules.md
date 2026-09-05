@@ -13,9 +13,31 @@ They are non-negotiable and override any other instruction.
   `feature-lifecycle`, or any other skill/workflow stage. A plain
   conversation ("can you fix this doc line") is not an exemption.
 - If you notice partway through a session that you're on `main` with
-  uncommitted edits: stop, move the changes into a worktree (stash the
-  specific file, enter/create a worktree, apply the stash there — don't
-  touch unrelated pre-existing changes on `main`), and continue there.
+  uncommitted edits: stop, enter/create a worktree, move the changes there,
+  and continue — without touching unrelated pre-existing changes on `main`.
+- **Never `git stash` to do it.** There is exactly one `refs/stash` per
+  repository, shared by the main checkout and every worktree, and the stack
+  has no owner — another agent's `pop` takes your entry with no way to tell
+  it was not theirs. `permissions.deny` in `.claude/settings.json` blocks every
+  mutating form outright — including the `git -C <path> stash …` spelling used
+  below — in the main checkout too, with no override. (The hook that used to do
+  this was removed in #588; the deny rules replaced it.) Move the changes as a
+  patch through the shared object database instead:
+
+  ```bash
+  git diff -- <file> | git -C .claude/worktrees/<name> apply   # copy across
+  git -C .claude/worktrees/<name> diff -- <file>               # VERIFY it landed
+  git checkout -- <file>                                       # only then revert on main
+  ```
+
+  Verify before reverting: `git checkout --` is the only destructive step and
+  there is no stash to fall back on. Add `--cached` to the first `git diff`
+  for staged changes, and drop `-- <file>` to move everything.
+- To set work aside on the branch you are already on (rather than move it to
+  another checkout), use a WIP commit — per-worktree, private, and
+  recoverable by SHA even if the branch moves:
+  `git add -A && git commit -m "wip: <what>"`, then `git reset --soft HEAD~1`
+  to pick it back up.
 - **`EnterWorktree` switches the shell's cwd, not file-tool paths.**
   `Read`/`Edit`/`Write` take the literal absolute path given — after
   entering a worktree, every such path must start with the worktree root
@@ -34,7 +56,14 @@ They are non-negotiable and override any other instruction.
 - Use `x | None`, never `Optional[x]` (no `Optional`/`Union` imports from `typing`)
 - Never use `hasattr`, `getattr(obj, key, default)`, or any silent fallback
 - Explicit failure over silent degradation — raise or assert, never degrade gracefully
-- All code must pass `black`, `ruff check`, `mypy` with zero errors/warnings
+- All code must pass `black` and `ruff check` with zero errors/warnings
+- `mypy` is a **ratchet, not a clean bill of health**: the gate fails on type
+  errors your branch *introduces* in the files it touches, measured against
+  the merge-base. It does not require you to clear a file's pre-existing
+  errors (there is a legacy backlog of ~2900 across ~191 files, burned down
+  as files get edited). New files are expected to be clean, since they have
+  no baseline. Run `scripts/mypy-changed.sh .venv/bin/mypy --include-worktree`,
+  or just `./scripts/quality-check.sh`
 
 ## Architecture
 
@@ -84,6 +113,20 @@ They are non-negotiable and override any other instruction.
 - Tests must verify **behavior** (what the system does), not **implementation** (how)
 - A test that breaks when an equivalent algorithm replaces another is a bad test
 - Never test: internal field names, algorithm-specific boundaries, exact interval counts
+- **Assert the outcome, not the command.** A test that pins the value written
+  to hardware (`vpp_power=+1`, `discharge_rate=100`, a TOU segment) proves the
+  *mapping* is unchanged. It does not prove the battery held, the spike was
+  covered, or the cost moved. Where the outcome is simulable, assert the
+  outcome — realized cost, SoE trajectory, resulting flows. Assert commands
+  only where no execution model exists, and say so in the test, because a
+  command-level test silently stops being evidence the moment the mapping is
+  right and the physics is wrong.
+- **A new test must be seen to fail without its fix.** Write it RED, or revert
+  the fix and watch it break. Repeatedly in this codebase a test has passed
+  while proving less than claimed — a bound asserted on one side only, a
+  comparison whose signal was swamped by a second varying term, a fixture that
+  could not reach the branch it named. "The suite is green" is evidence the
+  suite is satisfied, never that the behavior holds.
 
 ## Debugging Protocol
 
@@ -100,10 +143,11 @@ When fixing bugs, follow this two-phase approach:
 6. Propose the minimal fix with rationale based on verified facts
 7. Flag any assumptions you could NOT verify
 8. **Assess the scope of the fix before proposing where it goes.** Answer explicitly:
+   - **Workaround check, every fix:** does the diff add anything — a parameter, flag, default-fallback, second construction site, extra trigger or branch — whose only job is to route around a problem the fix itself ran into (ordering, timing, a dependency not available yet)? If yes, that's the wrong shape: fix that problem directly — usually reorder, or reuse/expose the thing that already exists. Worked examples: `docs/agents/patterns.md` → "Don't route around a problem instead of fixing it".
+   - Can't confidently answer "no" to the workaround check? Don't present the draft. Dispatch a fresh agent with no memory of your reasoning (`Plan` or general-purpose) to critique the design, and fold its pushback in first.
    - Does the fix stay entirely within the target method's *existing* stated responsibility (its name/docstring already cover it)? → local fix, proceed to propose it.
    - Does it require the target method to start doing something its name/docstring don't cover — a new side effect, a new trigger, a responsibility that used to belong elsewhere? → **this is a structural fix, not a local patch.** Do not bolt it onto the convenient method just because it already has the branch/condition you need (see Architecture → Separation of concerns). Name the method/module that *should* own the new responsibility instead — creating one if none fits — and route the fix through it, even if that touches more call sites.
    - Does answering the question above require touching more than one method, or does the "right owner" span multiple modules, or are there two-plus plausible owners with real tradeoffs between them? → this is large enough that a quick unilateral pick is itself a risk. Before writing any code: present the tradeoff explicitly and get the user's call, or (in an unattended pipeline with no user in the loop) dispatch a `Plan`-type agent for an independent architecture recommendation and include its reasoning in the fix proposal — do not silently default to "wherever the fix happens to fit least awkwardly."
-   - Red flag specific case — **shadow initialization**: if the proposed fix adds a new trigger for something already done in a lifecycle method, stop. The root cause is that the lifecycle method failed, not that a second path is needed. Fix the lifecycle method (or the reason it was skipped/blocked) instead. This is one instance of the general rule above, not a separate check.
 9. State the scope assessment (local / structural / needs a second opinion) as part of the fix proposal, not just the diff — a reviewer should never have to reverse-engineer which category you judged this to be.
 10. Wait for approval before writing code
 

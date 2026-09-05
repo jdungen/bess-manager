@@ -51,6 +51,14 @@ def _load_real_app_module(monkeypatch):
     monkeypatch.setenv("HA_URL", "http://ha.local")
     monkeypatch.delenv("HASSIO_TOKEN", raising=False)
 
+    # Real app.py's BESSController.__init__ calls time_utils.set_timezone()
+    # from the mocked HA config, permanently mutating the shared module-global
+    # TIMEZONE. Restore it on teardown so this file doesn't leak UTC into the
+    # rest of the test session (e.g. the historical-data dashboard tests).
+    import core.bess.time_utils as time_utils
+
+    monkeypatch.setattr(time_utils, "TIMEZONE", time_utils.TIMEZONE, raising=False)
+
     app_path = os.path.join(backend_dir, "app.py")
     spec = importlib.util.spec_from_file_location("real_backend_app", app_path)
     module = importlib.util.module_from_spec(spec)
@@ -127,3 +135,53 @@ class TestDeviceIdRehydration:
         # Stored-but-empty device_id passes through as "" (falsy), same as
         # growatt_device_id already behaves when the setting exists but is unset.
         assert mock_ha_controller_cls.call_args.kwargs["huawei_device_id"] == ""
+
+
+class TestTimezoneFetchOrdering:
+    """Issue #440: a failed timezone fetch must surface on the existing
+    RuntimeFailureTracker/dashboard-banner mechanism instead of vanishing
+    into a log line.
+
+    ha_controller.failure_tracker is only wired to a real RuntimeFailureTracker
+    inside BatterySystemManager.__init__ (battery_system_manager.py:202-214).
+    If the timezone fetch runs before BatterySystemManager is constructed,
+    ha_controller.failure_tracker is still None, so a final-attempt HA API
+    failure never reaches record_failure_once and is silently lost.
+    """
+
+    def test_timezone_fetch_runs_after_battery_system_manager_construction(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setattr(
+            _settings_store_module, "SETTINGS_PATH", _settings_path(tmp_path)
+        )
+        _write_settings(_settings_path(tmp_path))
+
+        call_order = []
+
+        mock_ha_controller_cls = MagicMock()
+        mock_ha_controller_cls.return_value.get_ha_config.side_effect = (
+            lambda: call_order.append("get_ha_config") or {"time_zone": "UTC"}
+        )
+        mock_bsm_cls = MagicMock()
+        mock_bsm_cls.return_value.is_configured = False
+
+        def _record_bsm_construction(*args, **kwargs):
+            call_order.append("battery_system_manager")
+            return mock_bsm_cls.return_value
+
+        mock_bsm_cls.side_effect = _record_bsm_construction
+
+        with (
+            patch.object(
+                _ha_api_module, "HomeAssistantAPIController", mock_ha_controller_cls
+            ),
+            patch.object(_bsm_module, "BatterySystemManager", mock_bsm_cls),
+        ):
+            _load_real_app_module(monkeypatch)
+
+        assert call_order == ["battery_system_manager", "get_ha_config"], (
+            "the timezone fetch must run after BatterySystemManager is "
+            "constructed, so ha_controller.failure_tracker is already wired "
+            "and a fetch failure gets recorded instead of silently lost"
+        )
