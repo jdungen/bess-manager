@@ -4,6 +4,29 @@ All notable changes to BESS Battery Manager will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [10.1.0-jvdd.2] - 2026-09-05
+
+Fork build: upstream `main` at **5e6cf85** — released 10.1.0 *plus* everything
+listed under Unreleased below — with the two AC-coupled/NL patches this fork
+carries. Both are opt-in switches, default OFF, so with them off this build
+behaves exactly like that upstream state.
+
+Note that Unreleased is upstream work Johan has not tagged as a release yet,
+including the in-progress InfluxDB → HA Recorder migration.
+
+### Added
+
+- **`external_solar_mode`** (Settings → Battery → PV coupling) — AC-coupled PV support. On installs where PV hangs off a separate inverter, the battery inverter has no DC solar input, so `SOLAR_STORAGE` periods left the battery idle. When enabled, `SOLAR_STORAGE` uses `grid_charge=True`, battery mode `battery_first`, and produces a real TOU segment / AC charge period on the Growatt MIN, SPH and solax_modbus paths. ([PR #167](https://github.com/johanzander/bess-manager/pull/167))
+- **`sell_price_equals_buy_price`** (Settings → Pricing → Price Calculation) — net metering support (Dutch *saldering*, in force through 2026). Exported energy offsets imported energy 1:1, so the sell price becomes the full buy price incl. markup, VAT and grid fees instead of `spot + export compensation`. Export Compensation and Export Spot Multiplier are hidden and ignored while enabled.
+
+### Changed
+
+- Re-ported onto upstream 10.1.0 and then onto `main`. The mode override now hooks `InverterController._mode_display_fields()` — upstream's single source of truth for a period's mode since 10.1.0 — instead of the individual `INTENT_TO_MODE` call sites it replaced, and the Growatt MIN grouping walk-back (`mode_at()`) applies the same override so segment boundaries stay consistent.
+
+### Removed
+
+- Fork-local **runtime error banner fix** (10.0.0-jvdd.2) — upstream 10.1.0 fixes the same defect its own way: the alert reads `occurrence_count` and shows `error_message`, and `error_type` is gone from the payload. The fork no longer carries a competing version.
+
 ## [Unreleased]
 
 ### Added
@@ -34,7 +57,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 - **Sub-period discharge authorization now values stored energy accurately** — the gate read the battery's marginal value from a single grid cell, which mis-priced it in both directions, so it both held and released the battery in the wrong periods. ([#683](https://github.com/johanzander/bess-manager/issues/683))
 - **The daily log no longer balloons to multiple megabytes** — the schedule and optimization tables are now logged only when the battery schedule actually changes, not re-dumped verbatim every 15-minute cycle. ([#701](https://github.com/johanzander/bess-manager/pull/701))
 - **The dashboard banner reports one line per affected device instead of one per component** — a single device outage previously lit up the banner with separate lines for Battery Control, Battery Monitoring and Energy Monitoring (and one recovery line per component afterwards); all now collapse to one device line, with per-sensor detail still on the System Health page. ([#701](https://github.com/johanzander/bess-manager/pull/701))
-
 ## [10.1.0] - 2026-08-22
 
 ### Added

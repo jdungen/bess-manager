@@ -31,6 +31,7 @@ TAX_REDUCTION = (
 )
 SPOT_MULTIPLIER = 1.0  # multiplicative factor on spot (1.0 = no adjustment)
 EXPORT_SPOT_MULTIPLIER = 1.0  # multiplicative factor on spot for sell price
+SELL_PRICE_EQUALS_BUY_PRICE = False  # net metering (e.g. NL saldering): sell = buy
 MIN_PROFIT = 0.2  # Minimum profit per kWh to consider a charge/discharge cycle
 USE_ACTUAL_PRICE = False  # Use raw Nordpool spot prices or include markup, VAT, etc.
 
@@ -96,6 +97,10 @@ class PriceSettings:
     tax_reduction: float = TAX_REDUCTION
     spot_multiplier: float = SPOT_MULTIPLIER
     export_spot_multiplier: float = EXPORT_SPOT_MULTIPLIER
+    # Net metering (e.g. NL "saldering", in force through 2026): exported
+    # energy offsets imported energy 1:1, so the effective sell price is the
+    # full buy price incl. markup, VAT and grid fees — not spot + compensation.
+    sell_price_equals_buy_price: bool = SELL_PRICE_EQUALS_BUY_PRICE
     min_profit: float = MIN_PROFIT
     use_actual_price: bool = USE_ACTUAL_PRICE
 
@@ -139,6 +144,10 @@ class BatterySettings:
     # #413's release behaviour. See core/bess/vpp_load_tracking.py.
     vpp_load_tracking_enabled: bool = False
     vpp_load_tracking_tick_seconds: int = VPP_LOAD_TRACKING_TICK_SECONDS
+    # AC-coupled PV opt-in: when True, SOLAR_STORAGE periods enable grid
+    # charging so the battery can AC-charge from surplus solar that flows
+    # back through the meter (no DC solar input on the battery inverter).
+    external_solar_mode: bool = False
     reserved_capacity: float = field(init=False)
     min_soe_kwh: float = field(init=False)
     max_soe_kwh: float = field(init=False)
@@ -206,6 +215,7 @@ class BatterySettings:
             self.cycle_cost_per_kwh = battery_config.get(
                 "cycle_cost_per_kwh", BATTERY_CHARGE_CYCLE_COST
             )
+            self.external_solar_mode = battery_config.get("external_solar_mode", False)
             self.__post_init__()
         return self
 

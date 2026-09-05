@@ -299,7 +299,9 @@ class SolaxModbusGrowattController(GrowattMinController):
         mode = "load_first"
         if current_period < len(self.strategic_intents):
             intent = self.strategic_intents[current_period]
-            mode = self.INTENT_TO_MODE.get(intent, "load_first")
+            mode = self._effective_mode_for_intent(
+                intent, self.INTENT_TO_MODE.get(intent, "load_first")
+            )
 
             if mode != self._last_written_tou_mode:
                 enabled = mode != "load_first"
@@ -598,7 +600,9 @@ class SolaxModbusGrowattController(GrowattMinController):
         mode = "load_first"
         if effective_period < len(self.strategic_intents):
             intent = self.strategic_intents[effective_period]
-            mode = self.INTENT_TO_MODE.get(intent, "load_first")
+            mode = self._effective_mode_for_intent(
+                intent, self.INTENT_TO_MODE.get(intent, "load_first")
+            )
 
         enabled = mode != "load_first"
         logger.info(

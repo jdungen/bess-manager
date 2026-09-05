@@ -430,6 +430,7 @@ class PriceManager:
         area: str,
         spot_multiplier: float = 1.0,
         export_spot_multiplier: float = 1.0,
+        sell_price_equals_buy_price: bool = False,
     ) -> None:
         """Initialize the price manager.
 
@@ -442,6 +443,8 @@ class PriceManager:
             area: Price area code (e.g. "SE4", "NO1", "DK1")
             spot_multiplier: Multiplicative factor on spot buy price (1.0 = no adjustment)
             export_spot_multiplier: Multiplicative factor on spot sell price
+            sell_price_equals_buy_price: Net metering (e.g. NL saldering) —
+                sell price is the full buy price instead of spot + compensation
         """
         self.price_source = price_source
         self.markup_rate = markup_rate
@@ -451,6 +454,7 @@ class PriceManager:
         self.area = area
         self.spot_multiplier = spot_multiplier
         self.export_spot_multiplier = export_spot_multiplier
+        self.sell_price_equals_buy_price = sell_price_equals_buy_price
         self._logger = logging.getLogger(__name__)
 
         # Cache for today's prices
@@ -495,6 +499,10 @@ class PriceManager:
         Returns:
             Calculated sell-back price
         """
+        if self.sell_price_equals_buy_price:
+            # Net metering (e.g. NL saldering): every exported kWh offsets an
+            # imported one on the bill, so its value is the full buy price.
+            return self._calculate_buy_price(base_price)
         return base_price * self.export_spot_multiplier + self.tax_reduction
 
     def get_price_data(self, target_date: date | None = None) -> list:

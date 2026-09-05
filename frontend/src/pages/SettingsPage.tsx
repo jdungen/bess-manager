@@ -42,6 +42,7 @@ const EMPTY_BATTERY: BatteryForm = {
   temperatureDeratingEnabled: false,
   inverterMaxAcPowerKw: 0, inverterAcPowerMargin: 0.05,
   exportCurtailmentEnabled: false, exportCurtailmentPriceFloor: 0,
+  externalSolarMode: false,
 };
 const EMPTY_HOME: HomeForm = {
   consumption: 3.5, consumptionStrategy: 'fixed',
@@ -58,6 +59,7 @@ const EMPTY_PRICING: PricingForm = {
   entsoeEntity: '',
   area: '', markupRate: 0, vatMultiplier: 1.25, additionalCosts: 0,
   taxReduction: 0, spotMultiplier: 1.0, exportSpotMultiplier: 1.0,
+  sellPriceEqualsBuyPrice: false,
 };
 const EMPTY_INVERTER: InverterForm = { inverterPlatform: 'growatt_server_min', deviceId: '', controlMode: 'tou' };
 
@@ -176,6 +178,7 @@ const SettingsPage: React.FC = () => {
         inverterAcPowerMargin: bat_s.inverterAcPowerMargin ?? 0.05,
         exportCurtailmentEnabled: bat_s.exportCurtailmentEnabled ?? false,
         exportCurtailmentPriceFloor: bat_s.exportCurtailmentPriceFloor ?? 0,
+        externalSolarMode: bat_s.externalSolarMode ?? false,
       };
       setBatteryForm(bat);
       savedBattery.current = JSON.stringify(bat);
@@ -210,6 +213,7 @@ const SettingsPage: React.FC = () => {
         taxReduction: elec_s.taxReduction ?? 0,
         spotMultiplier: elec_s.spotMultiplier ?? 1.0,
         exportSpotMultiplier: elec_s.exportSpotMultiplier ?? 1.0,
+        sellPriceEqualsBuyPrice: elec_s.sellPriceEqualsBuyPrice ?? false,
       };
       setPricingForm(p);
       savedPricing.current = JSON.stringify(p);
@@ -425,6 +429,7 @@ const SettingsPage: React.FC = () => {
           taxReduction: pricingForm.taxReduction,
           spotMultiplier: pricingForm.spotMultiplier,
           exportSpotMultiplier: pricingForm.exportSpotMultiplier,
+          sellPriceEqualsBuyPrice: pricingForm.sellPriceEqualsBuyPrice,
           useActualPrice: false,
         },
         energyProvider: {
@@ -472,6 +477,7 @@ const SettingsPage: React.FC = () => {
             enabled: batteryForm.temperatureDeratingEnabled,
             weatherEntity: sensors.shared?.['weather_entity'] ?? '',
           },
+          externalSolarMode: batteryForm.externalSolarMode,
         },
         ...(inverterForm.inverterPlatform === 'huawei_solar_luna2000'
           ? {}

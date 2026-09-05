@@ -72,6 +72,7 @@ const SetupWizardPage: React.FC = () => {
     inverterAcPowerMargin: 0.05,
     exportCurtailmentEnabled: false,
     exportCurtailmentPriceFloor: 0,
+    externalSolarMode: false,
   });
 
   const [inverterForm, setInverterForm] = useState<InverterForm>({
@@ -116,6 +117,7 @@ const SetupWizardPage: React.FC = () => {
     taxReduction: 0.2,
     spotMultiplier: 1.0,
     exportSpotMultiplier: 1.0,
+    sellPriceEqualsBuyPrice: false,
   });
 
   const handleScan = useCallback(async () => {
@@ -303,6 +305,7 @@ const SetupWizardPage: React.FC = () => {
         efficiencyCharge:         bat.efficiencyCharge         ?? f.efficiencyCharge,
         efficiencyDischarge:      bat.efficiencyDischarge      ?? f.efficiencyDischarge,
         temperatureDeratingEnabled: bat.temperatureDeratingEnabled ?? f.temperatureDeratingEnabled,
+        externalSolarMode:        bat.externalSolarMode        ?? f.externalSolarMode,
       }));
       setHomeForm(f => ({
         ...f,
@@ -327,6 +330,7 @@ const SetupWizardPage: React.FC = () => {
         taxReduction:          elec.taxReduction                    ?? f.taxReduction,
         spotMultiplier:        elec.spotMultiplier                  ?? f.spotMultiplier,
         exportSpotMultiplier:  elec.exportSpotMultiplier            ?? f.exportSpotMultiplier,
+        sellPriceEqualsBuyPrice: elec.sellPriceEqualsBuyPrice       ?? f.sellPriceEqualsBuyPrice,
         // Restore saved config entry IDs so manual entries survive a wizard re-run
         nordpoolConfigEntryId: ep.nordpoolOfficial?.configEntryId ?? f.nordpoolConfigEntryId,
         nordpoolEntity:        ep.nordpoolHacs?.entity           ?? f.nordpoolEntity,
@@ -390,6 +394,7 @@ const SetupWizardPage: React.FC = () => {
         maxSoc: batteryForm.maxSoc,
         maxChargeDischargePower: batteryForm.maxChargeDischargePowerKw,
         cycleCost: batteryForm.cycleCostPerKwh,
+        externalSolarMode: batteryForm.externalSolarMode,
         // Home
         currency: pricingForm.currency,
         consumption: homeForm.consumption,
@@ -409,6 +414,7 @@ const SetupWizardPage: React.FC = () => {
         taxReduction: pricingForm.taxReduction,
         spotMultiplier: pricingForm.spotMultiplier,
         exportSpotMultiplier: pricingForm.exportSpotMultiplier,
+        sellPriceEqualsBuyPrice: pricingForm.sellPriceEqualsBuyPrice,
         // Nordpool HACS entity
         nordpoolEntity: pricingForm.nordpoolEntity || undefined,
         // Octopus Energy entity IDs
