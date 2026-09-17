@@ -45,6 +45,7 @@ from .huawei_controller import HuaweiController
 from .inverter_controller import InverterController
 from .managed_loads import subtract_managed_loads
 from .models import (
+    ConsumptionBreakdown,
     DecisionData,
     EconomicData,
     EconomicSummary,
@@ -235,6 +236,9 @@ class BatterySystemManager:
         self._desired_grid_charge: bool = False  # grid_charge alongside the rate above
         self._desired_block_passive_charging: bool = False  # alongside the rate above
         self._desired_strategic_intent: str = ""  # alongside the rate above
+        self._desired_charge_rate: int = (
+            100  # GRID_CHARGING rate (#754) alongside the rate above
+        )
         self._last_applied_discharge_rate: int = 0  # Last rate written to inverter
 
         # Export-limit curtailment state (#269) — tracks whether the hardware
@@ -1979,7 +1983,7 @@ class BatterySystemManager:
 
     def _gather_optimization_data(
         self, period: int, current_soc: float, prepare_next_day: bool, period_count: int
-    ) -> tuple[int, dict[str, list[float]]] | None:
+    ) -> tuple[int, dict[str, Any]] | None:
         """Always return full period data combining actuals + predictions with correct SOC progression.
 
         Args:
@@ -2059,9 +2063,27 @@ class BatterySystemManager:
         # next run rather than tomorrow; and after the extension above, so a
         # block declared for tomorrow lands on tomorrow instead of today's
         # blocks being duplicated onto it.
+        residual_consumption = list(consumption_predictions)
         consumption_predictions = self._apply_consumption_overlay(
             consumption_predictions, period_count, prepare_next_day
         )
+
+        # --- Home-load forecast split (issue #749) ---
+        # residual is the forecast before Planned Consumption Changes (already
+        # post Managed Loads); planned is the net the overlay applied for the
+        # period (post-clamp); total is what the optimizer plans against. The
+        # invariant residual + planned == total holds by construction, so the
+        # dashboard can stack the two and land on the same curve it draws today.
+        # residual_consumption was captured from the pre-overlay array, which is
+        # always at least as long as this loop's bound.
+        consumption_breakdown_full = [
+            ConsumptionBreakdown(
+                residual=residual_consumption[i],
+                planned=consumption_predictions[i] - residual_consumption[i],
+                total=consumption_predictions[i],
+            )
+            for i in range(min(period_count, len(consumption_predictions)))
+        ]
 
         # --- Build data arrays ---
         consumption_data = [0.0] * period_count
@@ -2143,8 +2165,9 @@ class BatterySystemManager:
         if not prepare_next_day:
             combined_soe[optimization_period] = current_soe
 
-        optimization_data = {
+        optimization_data: dict[str, Any] = {
             "full_consumption": consumption_data,
+            "full_consumption_breakdown": consumption_breakdown_full,
             "full_solar": solar_data,
             "combined_actions": combined_actions,
             "combined_soe": combined_soe,
@@ -2301,7 +2324,7 @@ class BatterySystemManager:
     def _run_optimization(
         self,
         optimization_period: int,
-        optimization_data: dict[str, list[float]],
+        optimization_data: dict[str, Any],
         prices: list[float],
         price_entries: list[dict[str, Any]],
         prepare_next_day: bool,
@@ -2460,7 +2483,7 @@ class BatterySystemManager:
         optimization_period: int,
         result: OptimizationResult,
         prices: list[float],
-        optimization_data: dict[str, list[float]],
+        optimization_data: dict[str, Any],
         is_first_run: bool,
         prepare_next_day: bool,
     ) -> DPSchedule | None:
@@ -2491,6 +2514,7 @@ class BatterySystemManager:
 
             # Use actual array length for DST safety (92/96/100 periods)
             num_periods = len(combined_soe)
+            breakdown_full = optimization_data.get("full_consumption_breakdown") or []
             for i, period_data in enumerate(period_data_list):
                 target_period = optimization_period + i
                 if target_period < num_periods:
@@ -2502,6 +2526,12 @@ class BatterySystemManager:
                     )
                     # Store the SOE directly (it's already in the correct format from period data)
                     combined_soe[target_period] = period_data.energy.battery_soe_end
+                    # Carry the home-load split (#749) onto the PeriodData that
+                    # schedule_store persists and the daily view reads back.
+                    if target_period < len(breakdown_full):
+                        period_data.consumption_breakdown = breakdown_full[
+                            target_period
+                        ]
 
             # Log the corrected SOE progression
             logger.info("CORRECTED SOE progression:")
@@ -2859,6 +2889,19 @@ class BatterySystemManager:
                 period, battery_action_kw
             )
         )
+        # #754: the action-derived GRID_CHARGING rate, computed here (where
+        # `period` and `battery_action_kw` are known exactly) rather than
+        # re-derived from wall-clock time inside the controller -- which
+        # could not tell "the period this write is about" apart from
+        # "whatever period it happens to be right now" once a retry
+        # (_schedule_period_retry) fires minutes later against a plan whose
+        # rate can change every period.
+        assert self._inverter_controller is not None  # already dereferenced above
+        charge_rate = self._inverter_controller.compute_charge_rate(
+            strategic_intent,
+            self._inverter_controller.INTENT_TO_CONTROL[strategic_intent],
+            battery_action_kw,
+        )
 
         # Intra-period discharge gate: the optimizer's planned rate is a
         # 15-min average, but load_first lets the battery cover an
@@ -2973,6 +3016,7 @@ class BatterySystemManager:
         self._desired_grid_charge = grid_charge
         self._desired_block_passive_charging = block_passive_charging
         self._desired_strategic_intent = strategic_intent
+        self._desired_charge_rate = charge_rate
 
         # Check discharge inhibit (e.g. EV actively charging during Tibber grid award)
         if discharge_rate > 0:
@@ -3017,6 +3061,7 @@ class BatterySystemManager:
             block_passive_charging,
             strategic_intent,
             at_reserve_floor,
+            charge_rate,
         )
 
         if not success:
@@ -3036,6 +3081,7 @@ class BatterySystemManager:
                 discharge_rate,
                 block_passive_charging,
                 strategic_intent,
+                charge_rate=charge_rate,
             )
         else:
             self._last_applied_discharge_rate = discharge_rate
@@ -3101,12 +3147,18 @@ class BatterySystemManager:
         block_passive_charging: bool = False,
         strategic_intent: str = "",
         attempt: int = 1,
+        charge_rate: int = 100,
     ) -> None:
         """Schedule a one-shot retry of period hardware write.
 
         Retries twice within the 15-min period window (at +3 min and +8 min).
         If the scheduler is not available (e.g. during tests), the retry is
         skipped and the failure banner remains as-is.
+
+        charge_rate (#754) is captured here at the *original* period, same as
+        every other argument -- it must replay this period's actual planned
+        rate on retry, not whatever period the wall clock has moved to by
+        the time the retry fires.
         """
         max_attempts = len(self._PERIOD_RETRY_DELAYS_MIN)
         if attempt > max_attempts:
@@ -3137,6 +3189,7 @@ class BatterySystemManager:
                 block_passive_charging,
                 strategic_intent,
                 self._at_reserve_floor(),
+                charge_rate,
             )
             self._runtime_failure_tracker.dismiss_by_category("period_apply")
             if not success:
@@ -3156,6 +3209,7 @@ class BatterySystemManager:
                         block_passive_charging,
                         strategic_intent,
                         attempt + 1,
+                        charge_rate,
                     )
                 else:
                     self._runtime_failure_tracker.record_failure(
@@ -3270,8 +3324,40 @@ class BatterySystemManager:
                 # was consuming 5.2 of it). The understated basis then fed
                 # `optimize_battery_schedule(initial_cost_basis=...)`, making
                 # stored energy look cheaper to discharge than it was.
-                solar_to_battery = event.energy.solar_to_battery
-                grid_to_battery = event.energy.grid_to_battery
+                #
+                # During DELIBERATE grid charging (`battery_first`, #536) this
+                # split is the wrong way round. `EnergyData` allocates solar to
+                # the home first, which is right for load_first surplus
+                # charging, but in battery_first the PV is DC-coupled straight
+                # to the battery and the house runs off the grid -- so solar
+                # that really did charge the battery would get booked to the
+                # home, and the battery's charge booked entirely to the grid.
+                # The retired formula (min(charged, solar), remainder to grid)
+                # is the accurate one in that regime, so use it there instead
+                # of the home-first split -- confined to this cost-basis site,
+                # per the intent already recorded on the period; EnergyData's
+                # split (and the intent classifier that reads it) is unchanged.
+                #
+                # Keyed on strategic_intent (the DP's plan), not observed_intent
+                # (inferred from flows): observed_intent is itself derived via
+                # `infer_intent_from_flows`, which decides GRID_CHARGING purely
+                # from `grid_to_battery > 0.01` on this same home-first split --
+                # so it cannot independently resolve the plan-vs-execution
+                # question and would not detect a genuine divergence either.
+                # strategic_intent is what the issue's own measurement (#536)
+                # was computed against, and what actually commanded the
+                # inverter's topology for the period.
+                if event.decision.strategic_intent == "GRID_CHARGING":
+                    solar_to_battery = min(
+                        event.energy.solar_production, event.energy.battery_charged
+                    )
+                    grid_to_battery = min(
+                        max(0.0, event.energy.battery_charged - solar_to_battery),
+                        event.energy.grid_imported,
+                    )
+                else:
+                    solar_to_battery = event.energy.solar_to_battery
+                    grid_to_battery = event.energy.grid_to_battery
 
                 # Calculate costs using same logic as everywhere else
                 solar_cost = solar_to_battery * self.battery_settings.cycle_cost_per_kwh
@@ -3301,26 +3387,6 @@ class BatterySystemManager:
                 # grid charging would have booked the whole charge as nearly
                 # free. Caught in review on this repo's own evidence bundle,
                 # `historical_2026_07_18_charge_attribution.json` period 39.
-                #
-                # Known limitation, measured rather than assumed: during
-                # DELIBERATE grid charging (`battery_first`) this split is the
-                # wrong way round. `EnergyData` allocates solar to the home
-                # first, which is right for load_first surplus charging, but in
-                # battery_first the PV is DC-coupled straight to the battery and
-                # the house runs off the grid -- so solar that really did charge
-                # the battery gets booked to the home, and the battery's charge
-                # gets booked entirely to the grid. The retired formula happened
-                # to be the accurate one in that regime.
-                #
-                # Not fixed here because the trade is measured and lopsided.
-                # Across the 30 debug bundles in `docs/`: load_first charging is
-                # 264 periods / 191.1 kWh where this correction ADDS 55.15 SEK
-                # of correctly-attributed cost, against 26 GRID_CHARGING periods
-                # / 30.3 kWh where it overstates by 3.85 SEK -- and overstating
-                # makes the DP more reluctant to discharge, which forfeits
-                # margin rather than losing money. Making the split regime-aware
-                # (keying off `decision.strategic_intent`) is the real fix and a
-                # modelling decision in its own right, not a Phase 3 consolidation.
                 #
                 # Second known asymmetry: this can only push the basis UP.
                 # A grid counter that under-reads leaves a positive remainder
@@ -3418,13 +3484,32 @@ class BatterySystemManager:
                     logger.info("-" * 40)
                     for check in component["checks"]:
                         if check["status"] != "OK":
+                            # Two shapes are in live use across check_health()
+                            # implementations: name/entity_id/error (price_manager,
+                            # sensor_collector) and component/message (SPH/Huawei/
+                            # Solis controllers). Assuming the first crashed here
+                            # with KeyError('name') whenever a controller used the
+                            # second, and the outer except discarded the real
+                            # per-component result (#627). Detect the shape
+                            # explicitly and raise on neither, per rules.md's
+                            # ban on silent fallback.
+                            if "name" in check:
+                                label = check["name"]
+                                detail = check.get("error") or "No specific error"
+                            elif "component" in check:
+                                label = check["component"]
+                                detail = check.get("message") or "No specific error"
+                            else:
+                                raise ValueError(
+                                    f"Unrecognized health-check shape: {check!r}"
+                                )
                             entity_str = (
                                 f" ({check['entity_id']})"
                                 if check.get("entity_id")
                                 else ""
                             )
                             logger.info(
-                                f"  - {check['name']}{entity_str}: {check['status']} - {check['error'] or 'No specific error'}"
+                                f"  - {label}{entity_str}: {check['status']} - {detail}"
                             )
                     logger.info("-" * 40)
 
@@ -3751,6 +3836,9 @@ class BatterySystemManager:
             return
         if not self._supports_charge_rate_control:
             return
+        # is_configured already guarantees this; assert narrows it for the type
+        # checker (the property can't narrow the attribute).
+        assert self._inverter_controller is not None
 
         try:
             now = time_utils.now()
@@ -3764,8 +3852,13 @@ class BatterySystemManager:
             else:
                 # Power monitor disabled — write charge rate directly so the
                 # inverter register is not left at a stale value (e.g. 0% from a
-                # preceding LOAD_SUPPORT or BATTERY_EXPORT period).
-                self.controller.set_charging_power_rate(int(charge_rate))
+                # preceding LOAD_SUPPORT or BATTERY_EXPORT period). Deduped so an
+                # unchanged rate isn't re-sent to the Growatt cloud every tick —
+                # a surplus write that appears to contribute to intermittent
+                # write rejections (#741).
+                self._inverter_controller.write_charge_rate_if_changed(
+                    self.controller, int(charge_rate)
+                )
 
         except (
             AttributeError,
@@ -3820,6 +3913,7 @@ class BatterySystemManager:
             # mid-period, and omitting it would default to False and
             # re-assert the battery_first hold #592 released.
             self._at_reserve_floor(),
+            self._desired_charge_rate,
         )
         self._last_applied_discharge_rate = target_rate
 

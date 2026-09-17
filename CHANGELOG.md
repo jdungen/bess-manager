@@ -4,6 +4,20 @@ All notable changes to BESS Battery Manager will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [11.0.0-jvdd.1] - 2026-09-17
+
+Fork build: upstream `main` at **d392a3e** (released 11.0.0 plus the
+Unreleased items) with the same two AC-coupled/NL patches as 10.1.0-jvdd.2
+(`external_solar_mode`, `sell_price_equals_buy_price`), both opt-in and default OFF.
+
+### Changed
+
+- Merged upstream 11.0.0. Relevant for this install: #755 - Growatt VPP now
+  commands the plan's actual charge rate for GRID_CHARGING instead of a fixed +100%;
+  #766 - solar attributed to the battery first in GRID_CHARGING cost basis.
+- `external_solar_mode` override now also passes upstream's new `charge_rate`
+  through `_mode_display_fields()` (merge resolution in `inverter_controller.py`).
+
 ## [10.1.0-jvdd.2] - 2026-09-05
 
 Fork build: upstream `main` at **5e6cf85** — released 10.1.0 *plus* everything
@@ -29,29 +43,46 @@ including the in-progress InfluxDB → HA Recorder migration.
 
 ## [Unreleased]
 
+### Fixed
+
+- **The battery's stored-energy cost basis no longer overstates the grid's share during deliberate grid charging** — during `GRID_CHARGING` periods the accounting now attributes concurrent solar to the battery first (matching the battery-first inverter topology), instead of assuming the home-first order that only holds for solar-surplus charging. ([#536](https://github.com/johanzander/bess-manager/issues/536))
+
+## [11.0.0] - 2026-09-13
+
 ### Added
 
+- **Savings Report: Week view and per-period energy totals** — the report gains a **Week** resolution alongside Day/Month/Year, and each period now shows an **Energy** card with that period's home load, solar production, grid import, grid export and battery discharge — so you can zoom out and see both earnings and energy at a glance. Home consumption is now aggregated into the savings buckets (`homeConsumptionKwh`).
+- **Browse the Dashboard for earlier days** — the Dashboard gains a date selector with day-back/forward arrows so you can review how the system actually behaved on a past day (energy flows, schedule, SOC, and that day's cost & savings), the way the Growatt app lets you page back. Historical days are read from the persisted daily-view store. For a past day the System Overview shows just that day's Cost & Savings; the genuinely live widgets (real-time power/battery tiles, the "now" marker, tomorrow's plan) are today-only.
 - **Tell BESS what consumption is coming with Planned Consumption Changes** — declare an EV session or a skipped pool pump in a template sensor, and it applies on top of whichever consumption forecast you already use. ([#428](https://github.com/johanzander/bess-manager/issues/428))
+- **The dashboard Home Load curve now splits into residual and planned** — see which of the load is ordinary predicted usage and which is a known Planned Consumption Changes block (e.g. EV charging), with actual-vs-planned on elapsed periods. ([#749](https://github.com/johanzander/bess-manager/issues/749))
 - **Groundwork for VPP load tracking** — adds the opt-in `vpp_load_tracking_enabled` setting (default off) and the energy-budget model behind it; the live tracking loop follows separately. ([#520](https://github.com/johanzander/bess-manager/issues/520))
 - **Managed Loads — exclude a regular habit like EV charging from the `ha_statistics` baseline** — name the load's own cumulative energy sensor and BESS learns your normal usage without it, so you can announce it separately via Planned Consumption Changes. ([#706](https://github.com/johanzander/bess-manager/issues/706))
+- **A debug bundle now shows the charge/discharge power-rate and stop-SOC values BESS commanded** — each write logs its value at INFO, so a bundle can confirm what was sent without needing the failure that used to be the only trace. ([#719](https://github.com/johanzander/bess-manager/issues/719))
+- **A debug bundle now also shows the TOU mode BESS commanded each period** — TOU-segment and Solis-period writes log at INFO, including when a period deliberately leaves the mode unchanged, and these lines survive compact-log trimming. ([#717](https://github.com/johanzander/bess-manager/issues/717))
 
 ### Changed
 
 - **Cold-start history now comes from Home Assistant's recorder** — a fresh install, or one restarting after a long outage, backfills today's actual energy flows from HA's own history instead of requiring the InfluxDB add-on. ([#722](https://github.com/johanzander/bess-manager/issues/722))
 - **The 7-day load-power consumption forecast reads the recorder, not InfluxDB** — the strategy is renamed `influxdb_7d_avg` → `load_power_7d_avg` (the old value keeps working), needs no InfluxDB, and now also works on platforms with no lifetime load-energy sensor (SolaX Native, Solis). ([#722](https://github.com/johanzander/bess-manager/issues/722))
 - **InfluxDB support is deprecated** — installs that still have InfluxDB credentials configured see a one-time dashboard banner with migration notes. Nothing to do for most; the option is removed in a later update. ([#722](https://github.com/johanzander/bess-manager/issues/722))
+- **The System Health page no longer probes InfluxDB** — with historical reads now served by HA's recorder, the "Historical Data Access" check gave a false warning to installs that had correctly removed the InfluxDB add-on. ([#722](https://github.com/johanzander/bess-manager/issues/722))
 
 ### Fixed
 
+- **Home Consumption forecast chart now colors the Diff tooltip by favorability, not raw sign** — using more than planned shows red, using less shows green, matching how Solar Production already worked. ([#763](https://github.com/johanzander/bess-manager/issues/763))
+- **The System Health page no longer silently hides a real failure on Growatt SPH, Huawei, or Solis Modbus** — a crash in the health-check logging step was swallowing the actual per-component result. ([#627](https://github.com/johanzander/bess-manager/issues/627))
+- **Growatt VPP and SolaX no longer charge at full power when the plan called for less** — `GRID_CHARGING` now commands the DP's actual planned rate instead of always full power, so a fuse-aware throttled plan (#429) is no longer silently overridden at write time, which could starve a concurrent load like an EV charger. ([#754](https://github.com/johanzander/bess-manager/issues/754))
+- **Failed Home Assistant service calls now log the response body, not just the status** — retry/final-failure logs previously hid the actual error (a Growatt cloud error, InfluxDB's "no database", etc.) behind a bare "500 Server Error". ([#741](https://github.com/johanzander/bess-manager/issues/741))
+- **The Growatt charge-power-rate register is no longer re-sent to the cloud every cycle when unchanged** — `adjust_charging_power`'s direct-write path now dedupes like the grid-charge and discharge-rate registers already do, cutting surplus writes that likely contributed to intermittent Growatt cloud API rejections. ([#741](https://github.com/johanzander/bess-manager/issues/741))
 - **The HA Statistics consumption strategy is now available on Huawei (EMMA) and Solis** — the setup wizard exposes their lifetime load-consumption sensor, and discovery auto-maps it where present. ([#730](https://github.com/johanzander/bess-manager/issues/730))
 - **A positive-only Planned Consumption Changes block no longer triggers a false "subtracted more than the forecast held" warning** — the clamped-period count now counts only periods the overlay itself drove negative, not ones the base forecast already held. ([#734](https://github.com/johanzander/bess-manager/issues/734))
 - **A slow or failing electricity-price fetch no longer delays or skips the top-of-hour battery mode switch** — price fetching moved to its own scheduler job off the control path, and the optimizer reads a cache that a dedicated job keeps warm. ([#709](https://github.com/johanzander/bess-manager/issues/709))
 - **The "Strategic Intent" dashboard card no longer overflows when the current period is curtailed** — the "Curtailed (No Export)" note now renders as a small badge under the headline instead of being appended to the large headline text. ([#676](https://github.com/johanzander/bess-manager/issues/676))
 - **Tomorrow's prices no longer get stuck at an inflated value on the HACS Nordpool integration** — before Nordpool publishes next-day prices, BESS now waits for the sensor's `tomorrow_valid` flag instead of trusting a `tomorrow` array that still mirrors today, and it strips VAT from that array like every other price path. ([#704](https://github.com/johanzander/bess-manager/issues/704))
-- **The battery no longer drains to empty before midnight and re-imports in the morning when the overnight consumption forecast has an empty hour** — an empty HA-statistics bucket or a managed-load clamp put 0 kWh into an overnight period, which the terminal-value calculation misread as "solar has taken over the house" and collapsed the overnight reserve. ([#715](https://github.com/johanzander/bess-manager/issues/715))
-- **Huawei inverters can be configured manually** when auto-discovery finds no Huawei integration, and setup now requires the battery Device ID that `huawei_solar.set_tou_periods` targets — completing without one used to leave every schedule write failing. The LUNA2000 working-mode select is now optional, so EMMA-fronted installs that don't expose it can finish setup. ([#120](https://github.com/johanzander/bess-manager/issues/120))
-- **Huawei EMMA schedules accept its translated `Time Of Use` working mode** — the working-mode gate matches TOU options case- and separator-insensitively instead of requiring the exact stock `time_of_use_luna2000` label, while still failing loudly on a non-empty option list with no TOU equivalent (e.g. LG RESU). ([#120](https://github.com/johanzander/bess-manager/issues/120))
-- **Huawei discharge-stop SOC writes now target the battery discharge cutoff control** (`storage_discharging_cutoff_capacity`) rather than the unrelated grid-charge cutoff; a schema migration clears the stale mapping on existing installs so a wizard re-scan repoints it. ([#120](https://github.com/johanzander/bess-manager/issues/120))
+- **The battery no longer drains to empty before midnight and re-imports in the morning when the overnight consumption forecast has an empty hour** — an empty forecast hour was misread as "solar has taken over the house," collapsing the overnight reserve. ([#715](https://github.com/johanzander/bess-manager/issues/715))
+- **Huawei inverters can be configured manually** when auto-discovery finds no Huawei integration, requiring the battery Device ID that schedule writes need — the LUNA2000 working-mode select is now optional for EMMA-fronted installs that don't expose it. ([#120](https://github.com/johanzander/bess-manager/issues/120))
+- **Huawei EMMA schedules accept its translated `Time Of Use` working mode** instead of requiring the exact stock English label. ([#120](https://github.com/johanzander/bess-manager/issues/120))
+- **Huawei discharge-stop SOC writes now target the correct discharge cutoff control** rather than the unrelated grid-charge cutoff; a schema migration repoints existing installs. ([#120](https://github.com/johanzander/bess-manager/issues/120))
 - **The add-on no longer runs out of memory and stops restarting when the optimizer refines a near-tied decision** — the exact re-solve now runs within a bounded memory footprint. ([#697](https://github.com/johanzander/bess-manager/issues/697))
 - **The battery now keeps a sensible overnight reserve instead of all-or-nothing** — end-of-horizon energy is valued by how much the house needs before sunrise, so midnight charge no longer flips between empty and full. ([#602](https://github.com/johanzander/bess-manager/issues/602))
 - **Sub-period discharge authorization now values stored energy accurately** — the gate read the battery's marginal value from a single grid cell, which mis-priced it in both directions, so it both held and released the battery in the wrong periods. ([#683](https://github.com/johanzander/bess-manager/issues/683))

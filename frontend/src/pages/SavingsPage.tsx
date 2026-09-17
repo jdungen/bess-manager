@@ -6,9 +6,9 @@ import { SavingsAggregatePeriod } from '../api/scheduleApi';
 import { toISODate } from '../utils/timeUtils';
 import api from '../lib/api';
 
-type SavingsResolution = Extract<SavingsAggregatePeriod, 'day' | 'month' | 'year'>;
+type SavingsResolution = SavingsAggregatePeriod;
 
-const RESOLUTIONS: SavingsResolution[] = ['day', 'month', 'year'];
+const RESOLUTIONS: SavingsResolution[] = ['day', 'week', 'month', 'year'];
 
 const SavingsPage: React.FC = () => {
   const [systemMode, setSystemMode] = useState<string>('normal');
@@ -43,7 +43,13 @@ const SavingsPage: React.FC = () => {
             )}
           </div>
 
-          <div className="flex flex-wrap items-center gap-3">
+          <div className="flex flex-col items-end gap-3">
+            <DateSelector
+              selectedDate={selectedDate}
+              onDateChange={setSelectedDate}
+              availableDates={availableDates}
+              resolution={resolution}
+            />
             <div className="flex bg-gray-100 dark:bg-gray-700 rounded-lg p-1 w-fit">
               {RESOLUTIONS.map((r) => (
                 <button
@@ -59,12 +65,6 @@ const SavingsPage: React.FC = () => {
                 </button>
               ))}
             </div>
-            <DateSelector
-              selectedDate={selectedDate}
-              onDateChange={setSelectedDate}
-              availableDates={availableDates}
-              resolution={resolution}
-            />
           </div>
         </div>
       </div>
